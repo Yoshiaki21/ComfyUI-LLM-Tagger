@@ -44,6 +44,35 @@
 
 ---
 
+## タスク3: 指示書5章「LLMへのメッセージ構築」実装
+
+- **完了日**: 2026-08-17
+- **動作確認**: ✅済み（helper単体テスト＋実機Lemonade Server `192.168.85.57:13305` / `gemma-4-26B-A4B-it-QAT-GGUF` へのend-to-endリクエストで確認）
+- **新規ファイル**: なし
+- **修正ファイル**:
+  - `llm_caption_node.py` : 画像前処理・メッセージ構築・Lemonade Serverへのリクエスト送信を実装
+- **変更内容**:
+  - 依存追加: `numpy` / `PIL`（ComfyUI同梱のため追加インストール不要）
+  - `iter_images(image)` : ComfyUIの `IMAGE`（`[B,H,W,C]` バッチテンソル）と、上流が `OUTPUT_IS_LIST` の場合のテンソルのリスト、単枚 `[H,W,C]` のいずれでも「1枚単位」に平坦化して yield
+  - `tensor_to_pil()` : float32 0.0〜1.0 → uint8 PIL画像。グレースケール／RGBA も RGB に正規化
+  - `resize_if_needed()` : 長辺が `MAX_IMAGE_LONG_EDGE`(1024) を**超える場合のみ** LANCZOS でアスペクト比維持リサイズ。1024px以下は元オブジェクトをそのまま返す
+  - `encode_image_base64()` : PNGでbase64エンコード
+  - `build_user_text()` : 5.2の2パターン（`trigger_word` が空白のみの場合も空欄扱いで `Trigger word:` 行を省略）
+  - `build_messages()` : system message＝プロンプトファイルの中身そのまま、user message＝テキストパート＋`image_url`（`data:image/png;base64,...`）を同一message内に格納
+  - `build_chat_payload()` : `temperature` / `max_tokens` / `top_p`（内部固定 `FIXED_TOP_P = 1.0`）／`chat_template_kwargs.enable_thinking` を反映
+  - `request_chat_completion()` : `POST {base_url}/chat/completions` を `timeout_sec` 付きで送信
+  - `extract_response_text()` : 6章のパースは未実装のため生応答をそのまま返す。`content` が空で `reasoning_content` のみ返るサーバー実装向けに `<think>` で包むフォールバックのみ用意
+  - `INPUT_TYPES` に `enable_thinking`(BOOLEAN, default True) / `temperature`(FLOAT, 0.3, 0.0〜2.0) / `max_tokens`(INT, 2048) / `timeout_sec`(INT, 120) を追加
+  - `OUTPUT_IS_LIST = (True,)` を追加し、`caption_text` を入力画像と同枚数・同順序のリストとして返すよう変更（指示書2.2 / 9章の要件）
+- **備考**:
+  - **実機で確認できたAPI仕様（指示書11章の申し送り事項）**:
+    - 画像添付は OpenAI互換の `image_url` + `data:image/png;base64,...` 形式でそのまま通る
+    - `enable_thinking` は `chat_template_kwargs: {"enable_thinking": bool}` で有効。`True` にすると応答の `content` **先頭にインラインで `<think>...</think>` が含まれる**（`reasoning_content` として分離はされない）。→ **6章のパース実装時に `<think>` ブロックの除去が必須**
+    - `False` 指定時は `<think>` ブロックが出ないことも確認済み
+  - 確認済みの挙動: 1200x800→1024x683にリサイズされて送信／640x480はリサイズなし／バッチ2枚が入力順どおり2件のリストで返る
+  - 6章（出力パース）・7章（リトライ／エラーハンドリング）は今回未着手。現状は例外がそのまま上位に送出される
+  - テスト用に scratchpad へ pillow/numpy 入りの一時venvを作成（システムPythonにnumpy/PILが無く、`data/comfyui/venv` もsite-packagesがpython3.12・binのpythonが3.14で不整合のため）
+
 ## タスク2: 指示書4章「システムプロンプトファイル管理」実装
 
 - **完了日**: 2026-08-17
