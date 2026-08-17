@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
@@ -23,6 +24,22 @@ IMAGE_MIME_TYPE = "image/png"
 
 # 5.3 top_p は内部固定値
 FIXED_TOP_P = 1.0
+
+# 6章 出力パース
+# enable_thinking=True のとき content の先頭にインラインで <think>...</think> が含まれるため、
+# 閉じタグ以降のみをパース対象にする（実機のLemonade Serverで確認済みの挙動）
+THINK_CLOSE_TAG = "</think>"
+# PART1 / PART2 の区切り行（"---" のみの行。ハイフン3個以上を許容）
+PART_SEPARATOR_PATTERN = re.compile(r"^[ \t]*-{3,}[ \t]*$", re.MULTILINE)
+# 6.2 これより短い応答は「応答不正」とみなす（タグ1個の最短ケースを潰さない範囲で設定）
+MIN_VALID_RESPONSE_CHARS = 4
+# 6.1 結合フォーマットの区切り文字
+TAG_DELIMITER = ", "
+TAGS_CAPTION_DELIMITER = ". "
+
+
+class CaptionParseError(Exception):
+    """6.2 応答不正。7章のリトライ対象（リトライ処理自体は未実装）。"""
 
 
 def build_lemonade_base_url(host, port):
@@ -168,7 +185,7 @@ def request_chat_completion(host, port, api_key, payload, timeout_sec):
 
 
 def extract_response_text(response_payload):
-    # 6章のパースは未実装。ここでは生の応答テキストをそのまま取り出すだけ。
+    # HTTP応答から生のテキストを取り出すだけ（パースは parse_response 側で行う）
     message = response_payload["choices"][0]["message"]
     content = (message.get("content") or "").strip()
 
@@ -178,6 +195,72 @@ def extract_response_text(response_payload):
     if not content and reasoning:
         return f"<think>{reasoning}</think>"
     return content
+
+
+def strip_thinking(text):
+    # </think> 以降のみを抽出する。<think> が無い場合は全体を対象とする。
+    # 複数回出現した場合は最後の </think> 以降を採用する。
+    text = text or ""
+    _, separator, after = text.rpartition(THINK_CLOSE_TAG)
+    return after if separator else text
+
+
+def split_both_parts(text):
+    # 6章 both モード：最初の "---" 行で PART1（タグ）/ PART2（自然文）に分割
+    parts = PART_SEPARATOR_PATTERN.split(text, maxsplit=1)
+    if len(parts) < 2:
+        raise CaptionParseError("'---' 区切りが見つかりません")
+
+    tags_part, caption_part = parts[0].strip(), parts[1].strip()
+    if not tags_part:
+        raise CaptionParseError("'---' より前（PART1: タグ）が空です")
+    if not caption_part:
+        raise CaptionParseError("'---' より後（PART2: 自然文）が空です")
+    return tags_part, caption_part
+
+
+def normalize_tag_list(tags_part, trigger_word):
+    # 6.1 タグ区切りを ", " に正規化する。末尾のピリオドは自然文との区切りと重複するため落とす。
+    tags = [tag.strip() for tag in tags_part.rstrip().rstrip(".").split(",")]
+    tags = [tag for tag in tags if tag]
+
+    # トリガーワードはプログラム側で先頭に挿入するため、
+    # LLMが出力に含めてしまっていた場合は重複を避けて除去する
+    trigger_word = (trigger_word or "").strip()
+    if trigger_word:
+        tags = [tag for tag in tags if tag.lower() != trigger_word.lower()]
+    return tags
+
+
+def combine_both_output(tags_part, caption_part, trigger_word):
+    # 6.1 学習用結合フォーマット: {trigger_word}, {corrected_tags}. {natural_language_caption}
+    tags = normalize_tag_list(tags_part, trigger_word)
+
+    trigger_word = (trigger_word or "").strip()
+    if trigger_word:
+        # トリガーワードは常にタグ列の先頭へ確実に挿入（LLM出力に依存しない）
+        tags.insert(0, trigger_word)
+
+    tag_line = TAG_DELIMITER.join(tags)
+    if not tag_line:
+        raise CaptionParseError("PART1 から有効なタグを抽出できませんでした")
+    return f"{tag_line}{TAGS_CAPTION_DELIMITER}{caption_part}"
+
+
+def parse_response(raw_response, output_mode, trigger_word):
+    # 6章 パース本体。失敗時は CaptionParseError を送出する（7章のリトライ処理は未実装のため、
+    # 現状は例外がそのまま呼び出し元へ伝播する）。
+    body = strip_thinking(raw_response).strip()
+    if len(body) < MIN_VALID_RESPONSE_CHARS:
+        raise CaptionParseError(f"応答が短すぎます ({len(body)}文字): {body!r}")
+
+    if output_mode == "both":
+        tags_part, caption_part = split_both_parts(body)
+        return combine_both_output(tags_part, caption_part, trigger_word)
+
+    # tags_only / caption_only は </think> 除去後の応答全体をそのまま使う
+    # （プロンプト側で "---" 区切りなしの単純テキストを返すよう指示している）
+    return body
 
 
 class LLMCaptionGenerator:
@@ -205,7 +288,9 @@ class LLMCaptionGenerator:
                 "model": (model_list,),
                 "enable_thinking": ("BOOLEAN", {"default": True}),
                 "temperature": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "max_tokens": ("INT", {"default": 2048, "min": 1, "max": 32768}),
+                # enable_thinking=True では thinking だけで4000トークン超を消費する実測値があるため、
+                # 指示書の目安(2048)より大きめの既定値にしている（不足すると本体が出力されず応答不正になる）
+                "max_tokens": ("INT", {"default": 8192, "min": 1, "max": 32768}),
                 "timeout_sec": ("INT", {"default": 120, "min": 1, "max": 3600}),
             }
         }
@@ -226,8 +311,8 @@ class LLMCaptionGenerator:
     def generate(self, image, tags, trigger_word, output_mode, system_prompt_file, lemonade_host,
                  lemonade_port, lemonade_api_key, model, enable_thinking, temperature, max_tokens,
                  timeout_sec):
-        # 6章（出力パース）・7章（リトライ／エラーハンドリング）は未実装。
-        # 現状は LLM の生応答をそのまま caption_text に出力して動作確認する段階。
+        # 7章（リトライ／エラーハンドリング・ログ出力）は未実装。
+        # パース失敗時は CaptionParseError がそのまま送出される。
         if system_prompt_file == FALLBACK_SYSTEM_PROMPT_LABEL:
             system_prompt_text = ""
         else:
@@ -247,6 +332,7 @@ class LLMCaptionGenerator:
             response_payload = request_chat_completion(
                 lemonade_host, lemonade_port, lemonade_api_key, payload, timeout_sec
             )
-            results.append(extract_response_text(response_payload))
+            raw_response = extract_response_text(response_payload)
+            results.append(parse_response(raw_response, output_mode, trigger_word))
 
         return (results,)
