@@ -2,8 +2,8 @@ import json
 import urllib.error
 import urllib.request
 
-DEFAULT_LEMONADE_HOST = "127.0.0.1"
-DEFAULT_LEMONADE_PORT = 8000
+DEFAULT_LEMONADE_HOST = "192.168.85.57"
+DEFAULT_LEMONADE_PORT = 13305
 MODELS_FETCH_TIMEOUT_SEC = 3
 FALLBACK_MODEL_LABEL = "(Lemonade Server unavailable - check host/port)"
 
