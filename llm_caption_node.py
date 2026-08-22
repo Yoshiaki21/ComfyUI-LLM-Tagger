@@ -1,4 +1,5 @@
 import base64
+import datetime
 import io
 import json
 import os
@@ -39,8 +40,20 @@ TAG_DELIMITER = ", "
 TAGS_CAPTION_DELIMITER = ". "
 
 
+# 7章 エラーハンドリング・リトライ・ログ
+# 7.1 接続失敗／タイムアウト／パース失敗を同一カウンタで最大3回試行する
+MAX_ATTEMPTS = 3
+ERROR_LOG_FILENAME = "error.log"
+FULL_LOG_FILENAME = "log.log"
+# 7.3 ログの出力先。指示書は「入力画像と同じフォルダ」だが、ComfyUI の IMAGE 型には
+# パス情報が含まれないため、ノードディレクトリ直下の logs/ に固定する（運用上の決定）。
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+# 7.3 ログのタイムスタンプ書式
+LOG_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
 class CaptionParseError(Exception):
-    """6.2 応答不正。7章のリトライ対象（リトライ処理自体は未実装）。"""
+    """6.2 応答不正。7.1 のリトライ対象。"""
 
 
 def build_lemonade_base_url(host, port):
@@ -278,6 +291,74 @@ def parse_response(raw_response, output_mode, trigger_word):
     return body
 
 
+def split_image_name_entries(image_names):
+    # 改行区切り（カンマ区切りも許容）のファイル名／パス一覧を配列にする
+    return [entry.strip() for entry in re.split(r"[\r\n,]+", image_names or "") if entry.strip()]
+
+
+def ensure_log_dir():
+    # 7.3 ログ出力先（LOG_DIR）を用意する。作成に失敗してもログ書き込み側で握りつぶすため、
+    # ここでは警告を出すだけで本処理は止めない。
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+    except OSError as e:
+        print(f"[LLMCaptionGenerator] ログ出力先の作成に失敗しました ({LOG_DIR}): {e}")
+    return LOG_DIR
+
+
+def resolve_image_labels(image_name_entries, count):
+    # ログに出す画像名。namelist が渡っていればそのファイル名、無ければ連番で補う。
+    labels = []
+    for i in range(count):
+        if i < len(image_name_entries):
+            labels.append(os.path.basename(image_name_entries[i]) or image_name_entries[i])
+        else:
+            labels.append(f"image_{i + 1:03d}")
+    return labels
+
+
+def append_log_line(log_dir, filename, line):
+    # 7.3 追記型。書き込みのたびに open/close する（長時間バッチの途中でも内容が確定し、
+    # ComfyUIが落ちてもログが失われない）。ログ書き込みの失敗で本処理を止めないこと。
+    path = os.path.join(log_dir, filename)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        print(f"[LLMCaptionGenerator] ログ書き込みに失敗しました ({path}): {e}")
+
+
+def write_log(log_dir, message, is_error=False):
+    # log.log は全処理ログ、error.log は失敗のみ（error.log の内容は log.log にも含まれる）
+    line = f"[{datetime.datetime.now().strftime(LOG_TIMESTAMP_FORMAT)}] {message}"
+    append_log_line(log_dir, FULL_LOG_FILENAME, line)
+    if is_error:
+        append_log_line(log_dir, ERROR_LOG_FILENAME, line)
+
+
+def classify_error(error):
+    # 7.3/7.4 のログ・コンソール表示用の簡易理由
+    if isinstance(error, CaptionParseError):
+        return "parse_error"
+    if isinstance(error, urllib.error.HTTPError):
+        return f"http_{error.code}"
+    # 読み取りタイムアウトは TimeoutError、接続タイムアウトは URLError(reason=TimeoutError) で来る
+    if isinstance(error, TimeoutError) or isinstance(getattr(error, "reason", None), TimeoutError):
+        return "timeout"
+    if isinstance(error, urllib.error.URLError):
+        return "connection_failed"
+    if isinstance(error, (json.JSONDecodeError, KeyError, IndexError)):
+        return "invalid_response"
+    return type(error).__name__
+
+
+# 7.1 リトライ対象の例外。
+# urllib.error.URLError / HTTPError / TimeoutError はいずれも OSError のサブクラスなので
+# 接続失敗・タイムアウトは OSError で捕捉できる。JSON/キー欠落は応答異常、
+# CaptionParseError は 6.2 の応答不正。
+RETRYABLE_EXCEPTIONS = (OSError, json.JSONDecodeError, KeyError, IndexError, CaptionParseError)
+
+
 class LLMCaptionGenerator:
     # 1. 入力ウィジェット・入力ソケットの定義
     @classmethod
@@ -307,7 +388,13 @@ class LLMCaptionGenerator:
                 # 指示書の目安(2048)より大きめの既定値にしている（不足すると本体が出力されず応答不正になる）
                 "max_tokens": ("INT", {"default": 8192, "min": 1, "max": 32768}),
                 "timeout_sec": ("INT", {"default": 120, "min": 1, "max": 3600}),
-            }
+            },
+            # ログに出す画像のファイル名（任意）。ComfyUI の IMAGE 型にはパス情報が
+            # 含まれないため、LoRA Caption Load の namelist 相当を別途受け取る。
+            # 未指定の場合は image_001 形式の連番をログのラベルに使う。
+            "optional": {
+                "image_names": ("STRING", {"default": "", "multiline": True}),
+            },
         }
 
     # 2. 出力ソケットの型（複数なら型のタプル）
@@ -325,36 +412,82 @@ class LLMCaptionGenerator:
 
     def generate(self, image, tags, trigger_word, output_mode, system_prompt_file, lemonade_host,
                  lemonade_port, lemonade_api_key, model, enable_thinking, temperature, max_tokens,
-                 timeout_sec):
-        # 7章（リトライ／エラーハンドリング・ログ出力）は未実装。
-        # パース失敗時は CaptionParseError がそのまま送出される。
+                 timeout_sec, image_names=""):
         if system_prompt_file == FALLBACK_SYSTEM_PROMPT_LABEL:
             system_prompt_text = ""
         else:
             system_prompt_text = read_system_prompt_file(system_prompt_file)
 
-        results = []
         images = list(iter_images(image))
+        name_entries = split_image_name_entries(image_names)
+        log_dir = ensure_log_dir()
+        labels = resolve_image_labels(name_entries, len(images))
 
-        # デバッグ用の設定値サマリ。バッチ内で値は不変のため実行開始時に1回だけ出力する
+        # 7.4.1 デバッグ用の設定値サマリ。バッチ内で値は不変のため実行開始時に1回だけ出力する
         # （7.4 のコンソール出力簡略化を行う際もこの行は残すこと）
-        print(f"[LLMCaptionGenerator] 開始: {len(images)}枚, model={model}, "
-              f"thinking={enable_thinking}, temp={temperature}, top_p={FIXED_TOP_P}, "
-              f"max_tokens={max_tokens}, timeout={timeout_sec}s")
+        summary = (f"開始: {len(images)}枚, model={model}, mode={output_mode}, "
+                   f"prompt={system_prompt_file}, thinking={enable_thinking}, temp={temperature}, "
+                   f"top_p={FIXED_TOP_P}, max_tokens={max_tokens}, timeout={timeout_sec}s")
+        print(f"[LLMCaptionGenerator] {summary}")
+        print(f"[LLMCaptionGenerator] ログ出力先: {log_dir}")
+        write_log(log_dir, f"RUN {summary}")
 
+        # 7.2 事前チェック：tags が空文字ならLLMを呼ばずに即スキップ（リトライ対象外）
+        tags_is_empty = not (tags or "").strip()
+
+        results = []
+        success_count = 0
         for index, image_tensor in enumerate(images, start=1):
+            label = labels[index - 1]
+            write_log(log_dir, f"START: {label}")
+
+            if tags_is_empty:
+                print(f"[LLMCaptionGenerator] SKIPPED: {label} (empty_tags)")
+                write_log(log_dir, f"SKIPPED: {label} reason=empty_tags", is_error=True)
+                # 9章：スキップしても枚数・順序を崩さないよう空文字を入れる
+                results.append("")
+                continue
+
             pil_image = resize_if_needed(tensor_to_pil(image_tensor))
             image_base64 = encode_image_base64(pil_image)
-
             messages = build_messages(system_prompt_text, tags, trigger_word, image_base64)
             payload = build_chat_payload(model, messages, enable_thinking, temperature, max_tokens)
 
             print(f"[LLMCaptionGenerator] {index}/{len(images)} 送信中 "
                   f"(size={pil_image.size[0]}x{pil_image.size[1]})")
-            response_payload = request_chat_completion(
-                lemonade_host, lemonade_port, lemonade_api_key, payload, timeout_sec
-            )
-            raw_response = extract_response_text(response_payload)
-            results.append(parse_response(raw_response, output_mode, trigger_word))
+
+            # 7.1 接続失敗・タイムアウト・パース失敗を同一カウンタで最大 MAX_ATTEMPTS 回試行
+            caption = ""
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                try:
+                    response_payload = request_chat_completion(
+                        lemonade_host, lemonade_port, lemonade_api_key, payload, timeout_sec
+                    )
+                    raw_response = extract_response_text(response_payload)
+                    caption = parse_response(raw_response, output_mode, trigger_word)
+                    write_log(log_dir, f"SUCCESS: {label} mode={output_mode} attempt={attempt}")
+                    success_count += 1
+                    break
+                except RETRYABLE_EXCEPTIONS as e:
+                    reason = classify_error(e)
+                    write_log(log_dir,
+                              f"RETRY {attempt}/{MAX_ATTEMPTS}: {label} reason={reason} detail={e}")
+                    if attempt == MAX_ATTEMPTS:
+                        # 7.4 コンソールはファイル名＋簡易理由のみ。詳細はログファイル参照
+                        print(f"[LLMCaptionGenerator] SKIPPED: {label} ({reason})")
+                        write_log(log_dir,
+                                  f"SKIPPED: {label} reason={reason} "
+                                  f"({MAX_ATTEMPTS} attempts exhausted)",
+                                  is_error=True)
+                        # 9章：失敗時も空文字で枚数を揃える
+                        caption = ""
+
+            results.append(caption)
+
+        skipped_count = len(images) - success_count
+        print(f"[LLMCaptionGenerator] 完了: 成功 {success_count}件 / スキップ {skipped_count}件"
+              + (f"（詳細は {os.path.join(log_dir, ERROR_LOG_FILENAME)} を参照）"
+                 if skipped_count else ""))
+        write_log(log_dir, f"RUN END: success={success_count} skipped={skipped_count}")
 
         return (results,)

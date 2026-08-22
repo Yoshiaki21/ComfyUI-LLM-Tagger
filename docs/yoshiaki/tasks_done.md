@@ -177,3 +177,55 @@
   - 7章（リトライ・エラーハンドリング・ログファイル出力）は引き続き未着手。7.4のコンソール出力簡略化もこれから
 
 ---
+
+## タスク7: 指示書7章「エラーハンドリング・リトライ・ログ」実装
+
+- **完了日**: 2026-08-23
+- **動作確認**: ✅済み（実機Lemonade Server `192.168.85.57:13305` / `gemma-4-26B-A4B-it-QAT-GGUF` で、正常／タグ空文字／接続失敗／タイムアウト／パース失敗の5パターンをend-to-endで確認）
+- **新規ファイル**:
+  - `logs/error.log`, `logs/log.log` : 実行時に自動生成されるログ（リポジトリには含めない想定）
+- **修正ファイル**:
+  - `llm_caption_node.py` : 事前チェック・リトライ・ログ出力・コンソール出力を実装
+  - `LLM_Caption_Node_指示書.md` : 7.3のログ保存先を変更、2.1に `image_names` を追加、12章チェックリストを修正
+- **変更内容（7.2 事前チェック）**:
+  - `tags` が空文字（空白のみ含む）の場合、画像変換もLLM呼び出しも行わず即スキップ。リトライ対象外
+  - `tags` はバッチ全体で1つの文字列のため、空の場合は**全画像がスキップ**される（現行の入力設計どおり）
+- **変更内容（7.1 リトライ）**:
+  - `MAX_ATTEMPTS = 3` の**単一カウンタ**で、接続失敗／タイムアウト／パース失敗をまとめて再試行
+  - `RETRYABLE_EXCEPTIONS = (OSError, json.JSONDecodeError, KeyError, IndexError, CaptionParseError)`
+    - `urllib.error.URLError` / `HTTPError` / `TimeoutError` はいずれも `OSError` のサブクラスなので接続失敗・タイムアウトはこれで捕捉できる
+  - `classify_error()` を追加し、簡易理由を `timeout` / `connection_failed` / `http_{code}` / `parse_error` / `invalid_response` に分類
+  - **「最大3回リトライ」は合計3回試行と解釈**（指示書の「3回とも失敗した場合」に合わせた）。初回＋3回＝計4回にする場合は `MAX_ATTEMPTS = 4` に変えるだけ
+- **変更内容（9章 枚数維持）**:
+  - スキップ時は `caption_text` に空文字を入れ、入力画像と同じ枚数・順序を維持
+- **変更内容（7.3 ログ）**:
+  - `write_log(log_dir, message, is_error=False)` : `log.log` には常時、`is_error=True` のときは `error.log` にも同じ行を追記
+  - `append_log_line()` : **書き込みのたびに `open`/`close`**（指示どおり）。書き込み失敗は `print` するだけで本処理は止めない
+  - `ensure_log_dir()` : 出力先 `LOG_DIR` を `os.makedirs(exist_ok=True)` で用意
+  - 記録内容: `RUN 開始:...` / `START:` / `RETRY n/3:`（詳細な例外メッセージ付き）/ `SUCCESS:` / `SKIPPED:` / `RUN END: success=N skipped=M`
+- **変更内容（7.4 コンソール）**:
+  - 失敗時は `[LLMCaptionGenerator] SKIPPED: melte0001.png (timeout)` のみ。リトライ詳細はログファイルだけに記録
+  - 完了時に `完了: 成功 N件 / スキップ M件` を出力（スキップがある場合のみ `error.log` のパスを併記）
+- **ログ出力先の仕様変更（指示書7.3を書き換え）**:
+  - **問題**: 指示書7.3は「入力画像と同じフォルダ」にログを出す仕様だが、**ComfyUI の `IMAGE` 型にはファイルパス情報が含まれず**、2.1の入力定義にも画像フォルダの入力が無いため、ノード単体では画像フォルダを特定できない
+  - 当初は `image_folder` / `image_names` の2つを `optional` 入力として追加し「①`image_folder` → ②`image_names`のフルパスの親 → ③ノード配下 `logs/`」の順で解決する実装にしたが、**ユーザー判断でノードディレクトリ直下の `logs/` に固定**する方針に変更
+  - `LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")`（`system_prompts/` と同じ解決方式）。Dockerで `/app/custom_nodes/ComfyUI-LLM-Tagger/` に配置した場合は `/app/custom_nodes/ComfyUI-LLM-Tagger/logs/` になる
+  - `image_folder` 入力は用途が消えたため**削除**。`image_names`（改行区切り、`namelist` 相当）は**ログのファイル名として引き続き必要なので残した**。未指定時は `image_001` 形式の連番ラベル
+  - 実行開始時に `[LLMCaptionGenerator] ログ出力先: ...` を出力し、実際のパスを確認できるようにした
+  - 指示書側は 7.3 に【変更履歴 2026-08-23】として理由付きで反映済み。併せて 2.1 に `image_names` の行を追加、12章チェックリストを `logs/` 基準に修正
+- **検証結果**:
+  | ケース | コンソール | error.log |
+  |---|---|---|
+  | 正常（2枚） | 成功 2件 / スキップ 0件 | 記録なし |
+  | タグ空文字 | `SKIPPED: melte0001.png (empty_tags)` | `reason=empty_tags`（RETRY行なし） |
+  | 接続失敗（port 1） | `SKIPPED: ... (connection_failed)` | `reason=connection_failed (3 attempts exhausted)` |
+  | タイムアウト（`timeout_sec=1`） | `SKIPPED: ... (timeout)` | `reason=timeout (3 attempts exhausted)` |
+  | パース失敗（`both`＋tags_only用プロンプト） | `SKIPPED: ... (parse_error)` | `reason=parse_error (3 attempts exhausted)` |
+  - いずれのケースも `caption_text` は入力と同じ2件（失敗分は空文字）を返すことを確認
+  - 複数回の実行で `log.log` が追記されること（新規作成にならないこと）も確認
+- **備考**:
+  - `logs/` はリポジトリ直下に作られるため、`.gitignore` に `logs/` と `__pycache__/` を入れることを推奨（**未対応**）
+  - Docker運用ではコンテナ内パスになるため、ホストから読むにはそのフォルダのバインドマウントが必要
+  - 8章（`always_regenerate` / `IS_CHANGED`）は今回未着手
+
+---
