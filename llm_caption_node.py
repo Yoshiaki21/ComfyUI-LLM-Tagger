@@ -45,6 +45,10 @@ TAGS_CAPTION_DELIMITER = ". "
 MAX_ATTEMPTS = 3
 ERROR_LOG_FILENAME = "error.log"
 FULL_LOG_FILENAME = "log.log"
+# log_prompt が ON のときだけ書き出す、LLMへの送信内容と生応答の記録
+PROMPT_LOG_FILENAME = "prompt.log"
+# prompt.log の多行本文につけるインデント（行指向のログと混ざらないようにする）
+PROMPT_LOG_INDENT = "    "
 # 7.3 ログの出力先。指示書は「入力画像と同じフォルダ」だが、ComfyUI の IMAGE 型には
 # パス情報が含まれないため、ノードディレクトリ直下の logs/ に固定する（運用上の決定）。
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -354,12 +358,48 @@ def append_log_line(log_dir, filename, line):
         print(f"[LLMCaptionGenerator] ログ書き込みに失敗しました ({path}): {e}")
 
 
+def log_timestamp():
+    return datetime.datetime.now().strftime(LOG_TIMESTAMP_FORMAT)
+
+
 def write_log(log_dir, message, is_error=False):
     # log.log は全処理ログ、error.log は失敗のみ（error.log の内容は log.log にも含まれる）
-    line = f"[{datetime.datetime.now().strftime(LOG_TIMESTAMP_FORMAT)}] {message}"
+    line = f"[{log_timestamp()}] {message}"
     append_log_line(log_dir, FULL_LOG_FILENAME, line)
     if is_error:
         append_log_line(log_dir, ERROR_LOG_FILENAME, line)
+
+
+def write_prompt_log(log_dir, header, body=""):
+    # log_prompt が ON のときだけ呼ばれる。多行の本文はインデントして1ブロックとして追記する。
+    block = f"[{log_timestamp()}] {header}"
+    if body:
+        indented = "\n".join(PROMPT_LOG_INDENT + line for line in body.splitlines())
+        block = f"{block}\n{indented}"
+    append_log_line(log_dir, PROMPT_LOG_FILENAME, block)
+
+
+def describe_image_part(pil_image, image_base64):
+    # 画像パートの base64 は1枚で1MBを超えるため、ログには要約だけを残す
+    approx_kb = len(image_base64) * 3 // 4 // 1024
+    width, height = pil_image.size
+    return f"<image {width}x{height} {IMAGE_FORMAT} 約{approx_kb}KB / base64は省略>"
+
+
+def format_response_for_log(response_payload):
+    # 生応答の記録用。thinking は content と分離して返るサーバーがあるため両方を残す。
+    # ここで例外を出すとリトライ判定に紛れ込むため、すべて defensive に取り出す。
+    choices = response_payload.get("choices") or [{}]
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = choice.get("message") or {}
+    content = message.get("content") or ""
+    reasoning = message.get("reasoning_content") or ""
+
+    blocks = [f"finish_reason={choice.get('finish_reason')} usage={response_payload.get('usage')}"]
+    if reasoning:
+        blocks.append(f"--- reasoning_content ({len(reasoning)}文字) ---\n{reasoning}")
+    blocks.append(f"--- content ({len(content)}文字) ---\n{content}")
+    return "\n".join(blocks)
 
 
 def classify_error(error):
@@ -416,6 +456,9 @@ class LLMCaptionGenerator:
                 "timeout_sec": ("INT", {"default": 120, "min": 1, "max": 3600}),
                 # 8章 ON にすると IS_CHANGED が毎回異なる値を返しキャッシュを無効化する
                 "always_regenerate": ("BOOLEAN", {"default": False}),
+                # ON にすると LLM への送信内容と生応答を prompt.log に記録する（既定OFF）。
+                # システムプロンプトの検証用。コンソールには出さない（7.4準拠）。
+                "log_prompt": ("BOOLEAN", {"default": False}),
             },
             # ログに出す画像のファイル名（任意）。ComfyUI の IMAGE 型にはパス情報が
             # 含まれないため、LoRA Caption Load の namelist 相当を別途受け取る。
@@ -451,7 +494,7 @@ class LLMCaptionGenerator:
     @classmethod
     def IS_CHANGED(cls, image, tags, trigger_word, output_mode, system_prompt_file, lemonade_host,
                    lemonade_port, lemonade_api_key, model, enable_thinking, temperature, max_tokens,
-                   timeout_sec, always_regenerate, image_names=""):
+                   timeout_sec, always_regenerate, log_prompt, image_names=""):
         if first_value(always_regenerate, False):
             # ON: NaN は自身との等値比較が成立しないため、ComfyUI は常に「変化あり」と判断する
             return float("nan")
@@ -462,7 +505,7 @@ class LLMCaptionGenerator:
 
     def generate(self, image, tags, trigger_word, output_mode, system_prompt_file, lemonade_host,
                  lemonade_port, lemonade_api_key, model, enable_thinking, temperature, max_tokens,
-                 timeout_sec, always_regenerate=False, image_names=""):
+                 timeout_sec, always_regenerate=False, log_prompt=False, image_names=""):
         # always_regenerate はキャッシュ制御（IS_CHANGED）専用のため、生成処理では使用しない
         # INPUT_IS_LIST = True のため全入力がリストで届く。tags 以外は単一値として取り出す。
         trigger_word = first_value(trigger_word, "")
@@ -476,6 +519,7 @@ class LLMCaptionGenerator:
         temperature = first_value(temperature)
         max_tokens = first_value(max_tokens)
         timeout_sec = first_value(timeout_sec)
+        log_prompt = first_value(log_prompt, False)
         image_names = first_value(image_names, "")
 
         if system_prompt_file == FALLBACK_SYSTEM_PROMPT_LABEL:
@@ -498,6 +542,15 @@ class LLMCaptionGenerator:
         print(f"[LLMCaptionGenerator] {summary}")
         print(f"[LLMCaptionGenerator] ログ出力先: {log_dir}")
         write_log(log_dir, f"RUN {summary}")
+
+        # system message はバッチ内で不変のため実行開始時に1回だけ記録する
+        if log_prompt:
+            write_prompt_log(log_dir, f"==== RUN {summary} ====")
+            write_prompt_log(
+                log_dir,
+                f"PROMPT system ({system_prompt_file}, {len(system_prompt_text)}文字):",
+                system_prompt_text,
+            )
 
         # 9章 タグと画像の件数が食い違うと対応がずれるため警告する（処理自体は継続）
         tag_count = len(tags) if isinstance(tags, list) else 1
@@ -529,6 +582,14 @@ class LLMCaptionGenerator:
             print(f"[LLMCaptionGenerator] {index}/{len(images)} 送信中 "
                   f"(size={pil_image.size[0]}x{pil_image.size[1]})")
 
+            if log_prompt:
+                user_text = build_user_text(image_tags, trigger_word)
+                write_prompt_log(
+                    log_dir,
+                    f"PROMPT user {label} ({index}/{len(images)}):",
+                    f"{user_text}\n{describe_image_part(pil_image, image_base64)}",
+                )
+
             # 7.1 接続失敗・タイムアウト・パース失敗を同一カウンタで最大 MAX_ATTEMPTS 回試行
             caption = ""
             for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -536,6 +597,12 @@ class LLMCaptionGenerator:
                     response_payload = request_chat_completion(
                         lemonade_host, lemonade_port, lemonade_api_key, payload, timeout_sec
                     )
+                    if log_prompt:
+                        write_prompt_log(
+                            log_dir,
+                            f"RESPONSE {label} (attempt {attempt}/{MAX_ATTEMPTS}):",
+                            format_response_for_log(response_payload),
+                        )
                     raw_response = extract_response_text(response_payload)
                     caption = parse_response(raw_response, output_mode, trigger_word)
                     write_log(log_dir, f"SUCCESS: {label} mode={output_mode} attempt={attempt}")

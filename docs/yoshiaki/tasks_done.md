@@ -305,3 +305,38 @@
   - `.gitignore`（`logs/` と `__pycache__/`）は引き続き**未対応**
 
 ---
+
+## タスク10: プロンプト・生応答のログ出力（`prompt.log` / `log_prompt`）
+
+- **完了日**: 2026-08-23
+- **動作確認**: ✅済み（実機Lemonade Server `192.168.85.57:13305` / `gemma-4-26B-A4B-it-QAT-GGUF`、thinking ON で `prompt.log` の内容を確認。ON/OFF両方、引数一致も検証）
+- **新規ファイル**:
+  - `logs/prompt.log` : `log_prompt` ON時のみ生成されるプロンプト・応答ログ
+- **修正ファイル**:
+  - `llm_caption_node.py` : `log_prompt` ウィジェットと `prompt.log` 出力を追加
+  - `LLM_Caption_Node_指示書.md` : 7.3.1を新設、2.1に `log_prompt` を追加、12章チェックリストに2項目追加
+- **目的**:
+  - システムプロンプトが想定どおり機能しているかを検証するため、LLMへの送信内容と生応答を記録できるようにする
+- **設計判断（実装前に検討して決定）**:
+  1. **出力先は `prompt.log` に分離**（`log.log` に混ぜると通常のログが埋もれるため）
+  2. **生応答も記録する**（パース失敗の原因究明には「何を送って何が返ったか」の両方が要るため）
+  3. **thinking は全文記録**（文字数のみでは検証に使えない。実機の thinking はプロンプトの指示を1項目ずつ検証している様子がそのまま出るため、プロンプトのどの指示が効いていて どれが無視されたかを判断できる唯一の材料。1枚あたり約4KBで、除外する base64 の1MBと比べれば無視できるサイズ）
+  4. **コンソールには出さない**（7.4のコンソール簡易表示方針を維持）
+- **変更内容**:
+  - `INPUT_TYPES` の `required` に `"log_prompt": ("BOOLEAN", {"default": False})` を追加（`always_regenerate` の後ろ）。8.1の規約どおり `IS_CHANGED` と `generate()` の引数も同じ並びに揃えた
+  - 定数 `PROMPT_LOG_FILENAME = "prompt.log"` / `PROMPT_LOG_INDENT = "    "` を追加
+  - `log_timestamp()` を関数として切り出し、`write_log()` をそれに寄せた
+  - `write_prompt_log(log_dir, header, body)` を追加。多行の本文は継続行をインデントして1ブロックとして追記（行指向の `log.log` と混ざらない形）
+  - `describe_image_part(pil_image, image_base64)` を追加。**base64本体は記録せず** `<image 1024x768 PNG 約765KB / base64は省略>` に置換
+  - `format_response_for_log(response_payload)` を追加。`finish_reason` / `usage` / `reasoning_content` 全文 / `content` 全文をラベル付きで整形。**すべて `.get()` で defensive に取り出す**（ここで例外を出すと7.1のリトライ判定に紛れ込むため）
+  - 記録の頻度: `==== RUN ... ====` と `PROMPT system` は実行開始時に1回、`PROMPT user` は画像ごと、`RESPONSE` は試行ごと（リトライ時も各回記録）
+- **検証結果**:
+  - `log_prompt=False` → `prompt.log` が**作成されないこと**を確認
+  - `log_prompt=True`（thinking ON、1枚） → 102行 / 7,991文字。内訳は system prompt 2,551文字、user テキスト部、`reasoning_content` 4,003文字、`content` 294文字
+  - `<image 1024x768 PNG 約765KB / base64は省略>` の1行のみで、**base64本体は含まれない**ことを grep で確認
+  - `log.log` には従来どおり `RUN` / `START` / `SUCCESS` / `RUN END` のみが記録され、プロンプトが混ざらないことを確認
+  - `INPUT_TYPES` / `IS_CHANGED` / `generate()` の引数一致を `inspect` で再検証（16項目、すべて一致）
+- **備考**:
+  - 100枚バッチで約460KB/回の増加見込み（base64を除外しているため）。追記型なのでローテーションは未実装、肥大化したら手動削除
+  - `prompt.log` も `logs/` 配下のため `.gitignore` 済み
+---
