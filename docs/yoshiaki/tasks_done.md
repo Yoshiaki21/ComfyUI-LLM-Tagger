@@ -270,3 +270,38 @@
   - 8章（`always_regenerate` / `IS_CHANGED`）は引き続き未着手
 
 ---
+
+## タスク9: 指示書8章「キャッシュ制御（always_regenerate）」実装
+
+- **完了日**: 2026-08-23
+- **動作確認**: ✅済み（`INPUT_TYPES` と `IS_CHANGED` / `generate()` の引数一致を `inspect` で検証、ON/OFF両モードの戻り値、ComfyUIが実際に渡す形での呼び出し、`generate()` の後方互換）
+- **新規ファイル**: なし
+- **修正ファイル**:
+  - `llm_caption_node.py` : `always_regenerate` ウィジェットと `IS_CHANGED` を追加
+  - `LLM_Caption_Node_指示書.md` : 8.1（実装上の注意）を新設
+- **変更内容**:
+  - `INPUT_TYPES` の `required` 末尾に `"always_regenerate": ("BOOLEAN", {"default": False})` を追加（指示書2.1の並びに合わせて `timeout_sec` の後ろ）
+  - `IS_CHANGED` を `@classmethod` として実装
+    - ON → `float("nan")` を返す。NaN は自身との等値比較が成立しない（`nan == nan` は `False`）ためキャッシュキーが常に不一致になり、毎回LLMを呼ぶ
+    - OFF → 固定値 `False` を返し、ComfyUI標準のキャッシュ挙動に任せる
+  - 引数の並びを `INPUT_TYPES`（`required` → `optional`）と完全一致させ、`optional` の `image_names` のみ既定値を持たせた
+  - `generate()` にも `always_regenerate` を追加（キャッシュ制御専用のため生成処理では未使用。コメントで明記）
+- **ComfyUI本体のソースで確認した点（指示書8.1に反映済み）**:
+  - **`INPUT_IS_LIST = True` は `IS_CHANGED` にも適用される**。`IsChangedCache.get()` が `generate()` と同じ `_async_map_node_over_list` 経由で呼ぶため全入力がリストで届く → `always_regenerate` は `first_value()` で取り出す必要がある（タスク8で追加したヘルパーを流用）
+  - **接続済みの入力は `IS_CHANGED` 呼び出し時点で未確定であり `(None,)` で届く**（`execution.py` の `get_input_data` が `execution_list=None` のとき未解決リンクを `(None,)` にする）。判定はウィジェット値のみを根拠にすること
+  - **OFF時に固定値を返すのが正しい**。キャッシュキーは `[class_type, IS_CHANGEDの戻り値] + 全入力値 + 上流ノードの署名` で構成されるため（`comfy_execution/caching.py` の `get_immediate_node_signature`）、固定値でも入力が変われば再実行される
+- **検証結果**:
+  ```
+  引数一致 IS_CHANGED == INPUT_TYPES : True
+  引数一致 generate()  == INPUT_TYPES : True
+  ON  -> nan    isnan=True   自身と等しい？ False
+  OFF -> False  実行ごとに同値？ True
+  ```
+  - `image_names`（optional）を省略した呼び出しも成功
+  - ComfyUIが実際に渡す形（全入力リスト＋接続済み入力は `(None,)`）でON/OFF両方を確認
+  - `generate()` が `always_regenerate` を受け取っても従来どおり動作（2枚 → 出力2件）
+- **備考**:
+  - これで指示書の**3章〜9章がすべて実装済み**（1〜2章は定義、10章は同梱データ、11〜12章は申し送り・チェックリスト）
+  - `.gitignore`（`logs/` と `__pycache__/`）は引き続き**未対応**
+
+---

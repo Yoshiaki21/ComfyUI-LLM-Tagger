@@ -201,6 +201,15 @@ LLM応答は以下のマーカー形式で返させることを前提にパー�
 - **ON時**：`IS_CHANGED` メソッドで毎回異なる値（例：`float("nan")` または `time.time()`）を返し、ComfyUIのキャッシュを無効化して毎回LLM呼び出しを行う
 - **OFF時**：通常通り入力値のハッシュに基づくキャッシュ挙動に任せる（ComfyUI標準動作）
 
+### 8.1 実装上の注意（2026-08-23 ComfyUI本体のソース確認）
+
+- `IS_CHANGED` は **`@classmethod`** として定義し、**引数の並びを `INPUT_TYPES`（`required` → `optional`）と一致させる**こと。`optional` の入力のみ既定値を持たせる
+- **`INPUT_IS_LIST = True` は `IS_CHANGED` にも適用される**。`IsChangedCache.get()` が `generate()` と同じ `_async_map_node_over_list` 経由で呼ぶため、全入力がリストで届く。判定に使う値は単一値として取り出すこと（`execution.py` の `IsChangedCache`）
+- **他ノードから接続された入力（`image` / `tags` など）は `IS_CHANGED` 呼び出し時点では確定しておらず `(None,)` で届く**（`execution.py` の `get_input_data` は `execution_list=None` のため未解決リンクを `(None,)` にする）。したがって判定はウィジェット値のみを根拠にすること
+- **OFF時に固定値（`False` など）を返すのが正しい**。キャッシュキーは `[class_type, IS_CHANGEDの戻り値] + 全入力値 + 上流ノードの署名` で構成されるため（`comfy_execution/caching.py` の `get_immediate_node_signature`）、固定値を返しても入力が変われば再実行される
+- ON時に `float("nan")` を使う理由：NaN は自身との等値比較が成立しない（`nan == nan` は `False`）ため、キャッシュキーが常に不一致になる
+- `always_regenerate` は**キャッシュ制御専用**で生成処理では使わないが、ComfyUI は `INPUT_TYPES` の全入力を `FUNCTION` にも渡すため、`generate()` 側でも引数として受け取る必要がある
+
 ---
 
 ## 9. バッチ処理・型整合性の注意点

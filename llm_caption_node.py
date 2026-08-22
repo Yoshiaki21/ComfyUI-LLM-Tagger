@@ -414,6 +414,8 @@ class LLMCaptionGenerator:
                 # 指示書の目安(2048)より大きめの既定値にしている（不足すると本体が出力されず応答不正になる）
                 "max_tokens": ("INT", {"default": 8192, "min": 1, "max": 32768}),
                 "timeout_sec": ("INT", {"default": 120, "min": 1, "max": 3600}),
+                # 8章 ON にすると IS_CHANGED が毎回異なる値を返しキャッシュを無効化する
+                "always_regenerate": ("BOOLEAN", {"default": False}),
             },
             # ログに出す画像のファイル名（任意）。ComfyUI の IMAGE 型にはパス情報が
             # 含まれないため、LoRA Caption Load の namelist 相当を別途受け取る。
@@ -442,9 +444,26 @@ class LLMCaptionGenerator:
     # 4. ノード一覧で表示されるカテゴリ（サイドバーの分類）
     CATEGORY = "Image-Captioning-in"
 
+    # 5. 8章 キャッシュ制御。引数は INPUT_TYPES と同じ並び（optional の image_names のみ既定値あり）。
+    #    INPUT_IS_LIST = True のため IS_CHANGED にも全入力がリストで渡る（execution.py の
+    #    IsChangedCache が generate() と同じ _async_map_node_over_list 経由で呼ぶため）。
+    #    なお他ノードから接続された入力は IS_CHANGED 呼び出し時点では確定しておらず (None,) で届く。
+    @classmethod
+    def IS_CHANGED(cls, image, tags, trigger_word, output_mode, system_prompt_file, lemonade_host,
+                   lemonade_port, lemonade_api_key, model, enable_thinking, temperature, max_tokens,
+                   timeout_sec, always_regenerate, image_names=""):
+        if first_value(always_regenerate, False):
+            # ON: NaN は自身との等値比較が成立しないため、ComfyUI は常に「変化あり」と判断する
+            return float("nan")
+        # OFF: 固定値を返して ComfyUI 標準のキャッシュ挙動に任せる。
+        # キャッシュキーには IS_CHANGED の戻り値に加えて全入力値と上流ノードの署名が含まれるため
+        # （comfy_execution/caching.py の get_immediate_node_signature）、入力が変われば再実行される。
+        return False
+
     def generate(self, image, tags, trigger_word, output_mode, system_prompt_file, lemonade_host,
                  lemonade_port, lemonade_api_key, model, enable_thinking, temperature, max_tokens,
-                 timeout_sec, image_names=""):
+                 timeout_sec, always_regenerate=False, image_names=""):
+        # always_regenerate はキャッシュ制御（IS_CHANGED）専用のため、生成処理では使用しない
         # INPUT_IS_LIST = True のため全入力がリストで届く。tags 以外は単一値として取り出す。
         trigger_word = first_value(trigger_word, "")
         output_mode = first_value(output_mode)
