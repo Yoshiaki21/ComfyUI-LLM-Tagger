@@ -291,6 +291,32 @@ def parse_response(raw_response, output_mode, trigger_word):
     return body
 
 
+def first_value(value, default=None):
+    # INPUT_IS_LIST = True のため全入力がリストで届く。ウィジェット値は要素1個のリストになる。
+    # 未接続の optional 入力は素の値（関数定義のデフォルト）で来る場合もあるため両方許容する。
+    if isinstance(value, list):
+        return value[0] if value else default
+    return default if value is None else value
+
+
+def resolve_tags_per_image(tags, count):
+    # WD14 Tagger は OUTPUT_IS_LIST=(True,) で「画像1枚につき1件」のタグ文字列を返すため、
+    # i番目の画像に i番目のタグを対応させる。
+    # 手入力やSTRING直結で1件しか来ない場合は、全画像に同じタグを適用する（従来の挙動）。
+    entries = list(tags) if isinstance(tags, list) else [tags]
+    entries = [entry if isinstance(entry, str) else "" for entry in entries]
+
+    if not entries:
+        return [""] * count
+    if len(entries) == 1:
+        return [entries[0]] * count
+    # 件数が画像より多ければ切り捨て、少なければ空文字で埋める
+    # （空文字は 7.2 の事前チェックで empty_tags としてスキップ・記録される）
+    resolved = entries[:count]
+    resolved.extend([""] * (count - len(resolved)))
+    return resolved
+
+
 def split_image_name_entries(image_names):
     # 改行区切り（カンマ区切りも許容）のファイル名／パス一覧を配列にする
     return [entry.strip() for entry in re.split(r"[\r\n,]+", image_names or "") if entry.strip()]
@@ -401,6 +427,12 @@ class LLMCaptionGenerator:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("caption_text",)
 
+    # 9章 WD14 Tagger は OUTPUT_IS_LIST=(True,) で画像枚数分のタグをリストで返す。
+    # INPUT_IS_LIST を宣言しないと ComfyUI がリスト要素ごとにノードを再実行してしまい
+    # （execution.py の map_node_over_list）、タグと画像の対応が崩れて N×N 回 LLM を呼ぶことになる。
+    # 全入力をリストで受け取り、対応付けはノード側で行う。
+    INPUT_IS_LIST = True
+
     # caption_text は image と同じ枚数・同じ順序のリストとして返す（指示書2.2 / 9章）
     OUTPUT_IS_LIST = (True,)
 
@@ -413,12 +445,28 @@ class LLMCaptionGenerator:
     def generate(self, image, tags, trigger_word, output_mode, system_prompt_file, lemonade_host,
                  lemonade_port, lemonade_api_key, model, enable_thinking, temperature, max_tokens,
                  timeout_sec, image_names=""):
+        # INPUT_IS_LIST = True のため全入力がリストで届く。tags 以外は単一値として取り出す。
+        trigger_word = first_value(trigger_word, "")
+        output_mode = first_value(output_mode)
+        system_prompt_file = first_value(system_prompt_file)
+        lemonade_host = first_value(lemonade_host, DEFAULT_LEMONADE_HOST)
+        lemonade_port = first_value(lemonade_port, DEFAULT_LEMONADE_PORT)
+        lemonade_api_key = first_value(lemonade_api_key, "")
+        model = first_value(model)
+        enable_thinking = first_value(enable_thinking, True)
+        temperature = first_value(temperature)
+        max_tokens = first_value(max_tokens)
+        timeout_sec = first_value(timeout_sec)
+        image_names = first_value(image_names, "")
+
         if system_prompt_file == FALLBACK_SYSTEM_PROMPT_LABEL:
             system_prompt_text = ""
         else:
             system_prompt_text = read_system_prompt_file(system_prompt_file)
 
+        # image はバッチテンソル1個のリスト、または上流によってはテンソルのリストで届く
         images = list(iter_images(image))
+        tags_per_image = resolve_tags_per_image(tags, len(images))
         name_entries = split_image_name_entries(image_names)
         log_dir = ensure_log_dir()
         labels = resolve_image_labels(name_entries, len(images))
@@ -432,16 +480,22 @@ class LLMCaptionGenerator:
         print(f"[LLMCaptionGenerator] ログ出力先: {log_dir}")
         write_log(log_dir, f"RUN {summary}")
 
-        # 7.2 事前チェック：tags が空文字ならLLMを呼ばずに即スキップ（リトライ対象外）
-        tags_is_empty = not (tags or "").strip()
+        # 9章 タグと画像の件数が食い違うと対応がずれるため警告する（処理自体は継続）
+        tag_count = len(tags) if isinstance(tags, list) else 1
+        if tag_count > 1 and tag_count != len(images):
+            warning = f"WARNING: タグ {tag_count}件 と 画像 {len(images)}枚 の件数が一致しません"
+            print(f"[LLMCaptionGenerator] {warning}")
+            write_log(log_dir, warning)
 
         results = []
         success_count = 0
         for index, image_tensor in enumerate(images, start=1):
             label = labels[index - 1]
+            image_tags = tags_per_image[index - 1]
             write_log(log_dir, f"START: {label}")
 
-            if tags_is_empty:
+            # 7.2 事前チェック：tags が空文字ならLLMを呼ばずに即スキップ（リトライ対象外）
+            if not image_tags.strip():
                 print(f"[LLMCaptionGenerator] SKIPPED: {label} (empty_tags)")
                 write_log(log_dir, f"SKIPPED: {label} reason=empty_tags", is_error=True)
                 # 9章：スキップしても枚数・順序を崩さないよう空文字を入れる
@@ -450,7 +504,7 @@ class LLMCaptionGenerator:
 
             pil_image = resize_if_needed(tensor_to_pil(image_tensor))
             image_base64 = encode_image_base64(pil_image)
-            messages = build_messages(system_prompt_text, tags, trigger_word, image_base64)
+            messages = build_messages(system_prompt_text, image_tags, trigger_word, image_base64)
             payload = build_chat_payload(model, messages, enable_thinking, temperature, max_tokens)
 
             print(f"[LLMCaptionGenerator] {index}/{len(images)} 送信中 "

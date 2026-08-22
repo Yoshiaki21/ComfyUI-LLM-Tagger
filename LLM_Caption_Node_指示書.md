@@ -208,6 +208,32 @@ LLM応答は以下のマーカー形式で返させることを前提にパー�
 - `image` はリスト（バッチ）として渡されるため、ノード内部では画像枚数分ループしてLLM呼び出しを行う
 - 出力 `caption_text` は **入力 `image` と同じ枚数・同じ順序のリスト**として返すこと（スキップした画像も欠番にせず、空文字または明示的なプレースホルダーを入れて枚数を揃えるか、あるいは `LoRA Caption Save` 側の `namelist`/`path` との対応関係を崩さない設計にする。実装時にどちらが安全か要検証：**推奨は空文字で枚数を揃える方式**）
 
+### 9.1 `INPUT_IS_LIST = True` の宣言（必須）【2026-08-23 検証結果により確定】
+
+**`WD14 Tagger` は `OUTPUT_IS_LIST = (True,)` を宣言しており、「画像1枚につき1件」のタグ文字列を**リスト**で出力する**（`comfyui-wd14-tagger/wd14tagger.py`）。
+
+本ノードが `INPUT_IS_LIST` を宣言しないと、ComfyUI の実行エンジンは**リスト要素ごとにノードを再実行**する（`execution.py` の `map_node_over_list`。短いリストは最後の要素を使い回す）。その結果、画像N枚のとき:
+
+- 本ノードが **N回実行**され、そのたびに `image` には**N枚全部のバッチ**が渡る
+- **LLM呼び出しが N×N 回**発生し、タグと画像の対応が完全に崩れる
+- `caption_text` が **N²件**になり、`LoRA Caption Save` との枚数対応も壊れる
+
+→ **必ず `INPUT_IS_LIST = True` を宣言し、リストの対応付けはノード側で行うこと。**
+
+宣言すると全入力がリストで届くため、以下の取り扱いが必要:
+
+| 入力 | 届く形 | 取り扱い |
+|---|---|---|
+| `image` | バッチテンソル1個のリスト（上流によってはテンソルのリスト） | 1枚単位に平坦化してN枚を得る |
+| `tags` | 画像枚数分の文字列リスト | **i番目の画像に i番目のタグ**を対応させる |
+| `tags`（手入力・STRING直結） | 要素1個のリスト | 全画像に同じタグを適用（従来の挙動） |
+| `image_names` | 要素1個のリスト（`Name list` は `OUTPUT_IS_LIST` を持たない） | `[0]` を取って改行分割 |
+| その他ウィジェット | 要素1個のリスト | `[0]` を取って単一値として使う |
+
+- `tags` の件数と画像枚数が食い違う場合は**警告をコンソールとログに出力**し、処理は継続する（多い分は切り捨て、足りない分は空文字として 7.2 の `empty_tags` スキップに回す）
+- これにより `Load Image`（1枚）と `LoRA Caption Load`（N枚）の**どちらの構成でも同じコードパス**で動作する
+- 出力側の `OUTPUT_IS_LIST = (True,)` は変更不要。N件のリストを返せば `LoRA Caption Save` が画像ごとに1回ずつ呼ばれる（現在の `WD14 Tagger` → `Save` と同じ挙動）
+
 ---
 
 ## 10. 同梱するシステムプロンプトファイル（初期データ）
@@ -303,6 +329,14 @@ Output ONLY the natural language description. No explanation, no extra text, no 
 - 既存の `ComfyUI-WD14-Tagger` フォークとは独立したノードとして実装し、`tags` 入力経由でのみ連携する（WD14推論は内蔵しない）
 - Lemonade Server の API仕様（OpenAI互換 `/v1/chat/completions`、画像添付方式、thinkingパラメータの指定方法）は実装時に実サーバーで確認・調整すること
 
+### 11.1 周辺ノードの既知の問題（2026-08-23 ソース確認）
+
+`Image-Captioning-in-ComfyUI`（`LoRA Caption Load` / `LoRA Caption Save`）側に以下の問題がある。**本ノードの修正では解消できない**ため、運用で回避すること。
+
+- **フォルダ内の `.png` がちょうど1枚のとき `LoRA Caption Load` が壊れる**：`return (images[0], 1)` と2要素しか返しておらず、`RETURN_TYPES` の3出力と一致しない。1枚だけ処理したい場合は通常の `Load Image` を使う
+- **`Name list` と `Image list` の順序が保証されていない**：`Name list` は `glob.glob`、`Image list` は `os.listdir` と別々の方法で列挙しており、どちらもソートしていない。順序がずれるとログのファイル名と実際の失敗画像が食い違い、`LoRA Caption Save` の保存先ファイル名もずれる
+- `LoRA Caption Load` の出力型（参考）：`Name list` = `STRING`（`\n` 区切りのファイル名。`OUTPUT_IS_LIST` なし）、`path` = `STRING`（フォルダパス）、`Image list` = `IMAGE`（`torch.cat` した `[B,H,W,C]` バッチ）
+
 ---
 
 ## 12. 動作確認チェックリスト（実装後）
@@ -317,3 +351,6 @@ Output ONLY the natural language description. No explanation, no extra text, no 
 - [ ] 実行開始時に設定値サマリ行（枚数/model/thinking/temperature/top_p/max_tokens/timeout）が1回だけ出力される（7.4.1）
 - [ ] `always_regenerate` ONで毎回再生成、OFFでキャッシュが効く
 - [ ] LoRA Caption Load → 本ノード → LoRA Caption Save の接続で実際にバッチ処理が通る
+- [ ] `INPUT_IS_LIST = True` が宣言され、画像N枚に対しLLM呼び出しがN回（N²回でない）であること（9.1）
+- [ ] i番目の画像にi番目のタグが対応していること（9.1）
+- [ ] 通常の `Load Image`（1枚）と `LoRA Caption Load`（N枚）の両構成で動作すること（9.1）

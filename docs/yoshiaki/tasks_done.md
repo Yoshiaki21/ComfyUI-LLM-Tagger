@@ -229,3 +229,44 @@
   - 8章（`always_regenerate` / `IS_CHANGED`）は今回未着手
 
 ---
+
+## タスク8: 指示書9章「バッチ処理・型整合性」対応（`INPUT_IS_LIST = True`）
+
+- **完了日**: 2026-08-23
+- **動作確認**: ✅済み（送信内容を捕捉したペアリング検証＋実機Lemonade Serverでの1枚構成、件数不一致の警告、ヘルパー単体6パターン）
+- **新規ファイル**: なし
+- **修正ファイル**:
+  - `llm_caption_node.py` : `INPUT_IS_LIST = True` を宣言し、リスト入力の取り扱いを実装
+  - `LLM_Caption_Node_指示書.md` : 9.1を新設、11.1（周辺ノードの既知問題）を新設、12章チェックリストに3項目追加
+- **背景（発見した不具合）**:
+  - `LoRA Caption Load → WD14 Tagger → 本ノード → LoRA Caption Save` の構成を検討する中で発覚
+  - **`WD14 Tagger` は `OUTPUT_IS_LIST = (True,)` を宣言しており、「画像1枚につき1件」のタグ文字列をリストで返す**（`comfyui-wd14-tagger/wd14tagger.py:185-186`）
+  - 本ノードが `INPUT_IS_LIST` を宣言していなかったため、ComfyUIの実行エンジンが**リスト要素ごとにノードを再実行**する（`execution.py` の `map_node_over_list`。短いリストは最後の要素を使い回す仕様）
+  - 結果、画像N枚のとき **ノードがN回実行され、そのたびにN枚全部のバッチが渡る → LLM呼び出しが N×N 回**発生し、**タグと画像の対応が完全に崩れ**、`caption_text` が N²件になっていた
+  - 指示書9章の「実装時にどちらが安全か要検証」がまさにこの箇所だった
+- **変更内容**:
+  - クラスに **`INPUT_IS_LIST = True`** を宣言（`OUTPUT_IS_LIST = (True,)` は変更なし）
+  - `first_value(value, default)` を追加。リストで届くウィジェット値から単一値を取り出す。未接続の `optional` が素の値で届くケースにも対応
+  - `resolve_tags_per_image(tags, count)` を追加
+    - i番目の画像に i番目のタグを対応させる
+    - タグが1件のみ（手入力・STRING直結）なら全画像に同じタグを適用（従来の挙動を維持）
+    - 多い分は切り捨て、足りない分は空文字で埋める（空文字は7.2の `empty_tags` としてスキップ・記録される）
+  - `generate()` 冒頭で `tags` 以外の全入力を `first_value()` 経由で取得
+  - 7.2の空タグ判定を**バッチ全体 → 画像ごと**に変更
+  - タグ件数と画像枚数の不一致時に警告をコンソールとログへ出力（処理は継続）
+- **検証結果**:
+  - 3枚バッチ・タグ3件 → **LLM呼び出し3回**（修正前の設計なら9回）。1回目`1girl, standing` / 2回目`1girl, sitting` / 3回目`1girl, lying` と**正しく1対1対応**。出力3件
+  - ログにも `Name list` 由来の実ファイル名が `melte0001.png` → `0002` → `0003` の順で記録
+  - 通常の `Load Image` 1枚・`image_names` 未接続 → 実機で正常にキャプション生成（`image_names` 引数自体が渡らないケースも `first_value` のフォールバックで動作）
+  - 件数不一致（タグ2件・画像3枚）→ `WARNING: タグ 2件 と 画像 3枚 の件数が一致しません` を出力し、3枚目は `SKIPPED: image_003 (empty_tags)`、出力は3件を維持
+- **`image_names` の扱い**:
+  - ユーザー判断で**残す**ことに決定。`IMAGE` 型にファイル名が無い以上、`LoRA Caption Load` の `Name list` を受け取る経路はこれだけであり、削除すると `error.log` が `image_001` の連番になり失敗画像を特定できなくなるため
+  - `Name list` は `OUTPUT_IS_LIST` を持たない普通の STRING 出力なので、`INPUT_IS_LIST = True` 下では要素1個のリストで届く。`[0]` を取って改行分割すればよく、既存ロジックがそのまま使える
+  - 参考: `WD14 Tagger` にファイル名の入力が無いのは、同ノードがファイルもログも書かないため。ファイル名は `LoRA Caption Load` → `LoRA Caption Save` へ直接流れており、WD14 Tagger を迂回している
+- **備考（周辺ノードの既知の問題・本ノードでは解消不可）**:
+  - **フォルダ内の `.png` がちょうど1枚のとき `LoRA Caption Load` が壊れる**（`LoRAcaption.py:150` で `return (images[0], 1)` と2要素しか返さず `RETURN_TYPES` の3出力と不一致）。1枚だけ処理する場合は通常の `Load Image` を使うこと
+  - **`Name list` と `Image list` の順序が保証されていない**（前者は `glob.glob`、後者は `os.listdir`、どちらもソートなし）。ずれるとログのファイル名と実際の失敗画像が食い違う
+  - `image_names` の区切りは改行とカンマだが、カンマを含むファイル名は使わない運用のため対処不要と判断
+  - 8章（`always_regenerate` / `IS_CHANGED`）は引き続き未着手
+
+---
