@@ -26,8 +26,9 @@ IMAGE_MIME_TYPE = "image/png"
 FIXED_TOP_P = 1.0
 
 # 6章 出力パース
-# enable_thinking=True のとき content の先頭にインラインで <think>...</think> が含まれるため、
-# 閉じタグ以降のみをパース対象にする（実機のLemonade Serverで確認済みの挙動）
+# 実機の Lemonade Server は thinking を message.reasoning_content に分離して返し、
+# content にはインラインの <think> を含めない（2026-08-23 実機再確認）。
+# ただし <think> をインラインで返すサーバー／モデルもあるため、保険として除去処理は残す。
 THINK_CLOSE_TAG = "</think>"
 # PART1 / PART2 の区切り行（"---" のみの行。ハイフン3個以上を許容）
 PART_SEPARATOR_PATTERN = re.compile(r"^[ \t]*-{3,}[ \t]*$", re.MULTILINE)
@@ -186,20 +187,34 @@ def request_chat_completion(host, port, api_key, payload, timeout_sec):
 
 def extract_response_text(response_payload):
     # HTTP応答から生のテキストを取り出すだけ（パースは parse_response 側で行う）
-    message = response_payload["choices"][0]["message"]
+    choice = response_payload["choices"][0]
+    message = choice["message"]
     content = (message.get("content") or "").strip()
+    if content:
+        return content
 
-    # thinking を content と分離して返すサーバー実装もあるため、
-    # content が空のときだけ reasoning_content を可視化して返す（動作確認用）。
-    reasoning = (message.get("reasoning_content") or "").strip()
-    if not content and reasoning:
-        return f"<think>{reasoning}</think>"
-    return content
+    # 実機のサーバーは thinking を reasoning_content に分離するため、
+    # content が空 = 本文が1文字も生成されていない状態。ここで理由を確定させておかないと
+    # 6章のパースで「応答が短すぎます (0文字)」という原因不明のエラーになる。
+    finish_reason = choice.get("finish_reason")
+    thinking_chars = len((message.get("reasoning_content") or "").strip())
+    if finish_reason == "length":
+        raise CaptionParseError(
+            f"max_tokens に達したため本文が生成されませんでした"
+            f"（thinking で {thinking_chars} 文字を消費）。"
+            f"max_tokens を増やすか enable_thinking を OFF にしてください"
+        )
+    raise CaptionParseError(
+        f"モデルが本文を返しませんでした (finish_reason={finish_reason}, "
+        f"thinking {thinking_chars} 文字)"
+    )
 
 
 def strip_thinking(text):
     # </think> 以降のみを抽出する。<think> が無い場合は全体を対象とする。
     # 複数回出現した場合は最後の </think> 以降を採用する。
+    # 実機のサーバーは thinking を分離して返すためここは通常ノーオペだが、
+    # インラインで <think> を返す構成向けの保険として残している。
     text = text or ""
     _, separator, after = text.rpartition(THINK_CLOSE_TAG)
     return after if separator else text
@@ -320,6 +335,13 @@ class LLMCaptionGenerator:
 
         results = []
         images = list(iter_images(image))
+
+        # デバッグ用の設定値サマリ。バッチ内で値は不変のため実行開始時に1回だけ出力する
+        # （7.4 のコンソール出力簡略化を行う際もこの行は残すこと）
+        print(f"[LLMCaptionGenerator] 開始: {len(images)}枚, model={model}, "
+              f"thinking={enable_thinking}, temp={temperature}, top_p={FIXED_TOP_P}, "
+              f"max_tokens={max_tokens}, timeout={timeout_sec}s")
+
         for index, image_tensor in enumerate(images, start=1):
             pil_image = resize_if_needed(tensor_to_pil(image_tensor))
             image_base64 = encode_image_base64(pil_image)
@@ -328,7 +350,7 @@ class LLMCaptionGenerator:
             payload = build_chat_payload(model, messages, enable_thinking, temperature, max_tokens)
 
             print(f"[LLMCaptionGenerator] {index}/{len(images)} 送信中 "
-                  f"(size={pil_image.size[0]}x{pil_image.size[1]}, model={model})")
+                  f"(size={pil_image.size[0]}x{pil_image.size[1]})")
             response_payload = request_chat_completion(
                 lemonade_host, lemonade_port, lemonade_api_key, payload, timeout_sec
             )

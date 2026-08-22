@@ -1,3 +1,10 @@
 /docs/yoshiaki/tasks_done.mdに作業に内容を記録して
 
 http://lemonade:13305/api/v1
+
+curl -s http://lemonade:13305/api/v1/models | jq -r '.data[].id'
+
+curl -s http://192.168.85.57:13305/api/v1/models | jq -r '.data[].id'
+
+2026/08/17
+claude --resume 73c97efd-b3be-4581-be49-07f423cae57f

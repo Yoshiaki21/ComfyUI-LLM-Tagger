@@ -177,6 +177,14 @@ LLM応答は以下のマーカー形式で返させることを前提にパー�
 - 成功時は簡易メッセージ（進捗程度）
 - 失敗時は **ファイル名＋簡易理由のみ**（例：`SKIPPED: suzune_001.png (timeout)`）。詳細はログファイル参照とする
 
+#### 7.4.1 設定値サマリ行（デバッグ用・必須）
+- **実行開始時に1回だけ**、送信パラメータのサマリをコンソールに出力する
+  - 出力例：`[LLMCaptionGenerator] 開始: 12枚, model=gemma-4-26B-A4B-it-QAT-GGUF, thinking=True, temp=0.3, top_p=1.0, max_tokens=8192, timeout=120s`
+  - 出力項目：画像枚数 / `model` / `enable_thinking` / `temperature` / `top_p`（内部固定値のためUIから見えない） / `max_tokens` / `timeout_sec`
+  - バッチ内でこれらの値は不変のため、画像ごとには出力しない（100枚処理で同じ設定が100回出るのを避ける）
+- 画像ごとの進捗行は簡易表示のみとする（例：`[LLMCaptionGenerator] 1/12 送信中 (size=1024x768)`）
+- **重要**：本項の設定値サマリ行は、7章のコンソール出力簡略化を実装する際も **削除・省略しないこと**。設定ミス（`max_tokens` 不足による本文未生成など）に起因する不具合の切り分けに必須であり、実測でこの切り分けが必要になった経緯がある
+
 ---
 
 ## 8. キャッシュ制御（`always_regenerate`）
@@ -297,5 +305,6 @@ Output ONLY the natural language description. No explanation, no extra text, no 
 - [ ] タイムアウト／接続失敗／パース失敗がそれぞれ3回リトライ後にスキップされる
 - [ ] `error.log` と `log.log` が画像フォルダに正しく追記される
 - [ ] コンソール出力が簡易表示のみになっている
+- [ ] 実行開始時に設定値サマリ行（枚数/model/thinking/temperature/top_p/max_tokens/timeout）が1回だけ出力される（7.4.1）
 - [ ] `always_regenerate` ONで毎回再生成、OFFでキャッシュが効く
 - [ ] LoRA Caption Load → 本ノード → LoRA Caption Save の接続で実際にバッチ処理が通る

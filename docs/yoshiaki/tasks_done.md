@@ -44,6 +44,27 @@
 
 ---
 
+## タスク2: 指示書4章「システムプロンプトファイル管理」実装
+
+- **完了日**: 2026-08-17
+- **動作確認**: ✅済み（ファイル一覧取得・読み込み・フォールバック（空フォルダ／フォルダ不在）・`generate()` 全体の動作をスクリプトで確認）
+- **新規ファイル**:
+  - `system_prompts/caption_training_both.txt` : 学習用（タグ+自然文両方）システムプロンプト
+  - `system_prompts/caption_tags_only.txt` : タグ抽出・整合性チェック用システムプロンプト
+  - `system_prompts/caption_text_only.txt` : 自然文のみ生成用システムプロンプト
+- **修正ファイル**:
+  - `llm_caption_node.py` : システムプロンプトファイル一覧取得・読み込み処理を追加
+- **変更内容**:
+  - `list_system_prompt_files()` を追加。`system_prompts/`（ノード自身のディレクトリ基準）内の `.txt` ファイル名一覧をソートして返す。フォルダ不在・読み取り不可時は例外を握りつぶして空リストを返す
+  - `read_system_prompt_file(filename)` を追加。指定ファイルの中身をUTF-8でそのまま読み込んで返す
+  - `INPUT_TYPES` に `system_prompt_file` コンボボックスを追加。候補が0件の場合は `"(no .txt files found in system_prompts/)"` にフォールバック
+  - `generate()` は `system_prompt_file` を受け取り中身を読み込むところまで実装。LLMメッセージ構築（5章）へはまだ組み込んでいない（ダミー出力に文字数だけ含めて動作確認）
+- **備考**:
+  - モデル一覧と同様、ファイル一覧・中身の読み込みは `INPUT_TYPES`／`generate()` 呼び出しのたびに実行されるため、`.txt` の追加・編集はComfyUIサーバー再起動なしでも次回実行時に反映される（ただしコンボボックスの選択肢自体は他ウィジェットと同じくF5リロードが必要）
+  - 5〜6章（LLM呼び出し本体・出力パース）は今回未着手
+
+---
+
 ## タスク3: 指示書5章「LLMへのメッセージ構築」実装
 
 - **完了日**: 2026-08-17
@@ -98,21 +119,61 @@
   - 参考: トリガーワード空欄で `caption_training_both.txt` を使うと、モデルがプロンプト内の例文をそのまま使い `@charactername` と出力するケースがあった。プロンプト文面側の課題であり6章のパース範囲外
   - 7章（リトライ・エラーハンドリング・ログ出力）は今回未着手
 
-## タスク2: 指示書4章「システムプロンプトファイル管理」実装
+---
 
-- **完了日**: 2026-08-17
-- **動作確認**: ✅済み（ファイル一覧取得・読み込み・フォールバック（空フォルダ／フォルダ不在）・`generate()` 全体の動作をスクリプトで確認）
-- **新規ファイル**:
-  - `system_prompts/caption_training_both.txt` : 学習用（タグ+自然文両方）システムプロンプト
-  - `system_prompts/caption_tags_only.txt` : タグ抽出・整合性チェック用システムプロンプト
-  - `system_prompts/caption_text_only.txt` : 自然文のみ生成用システムプロンプト
+## タスク5: 「応答が短すぎます (0文字)」バグ修正（5章／6章の不整合）
+
+- **完了日**: 2026-08-23
+- **動作確認**: ✅済み（実機Lemonade Server `192.168.85.57:13305` / `gemma-4-26B-A4B-it-QAT-GGUF` で4ケース検証）
+- **新規ファイル**: なし
 - **修正ファイル**:
-  - `llm_caption_node.py` : システムプロンプトファイル一覧取得・読み込み処理を追加
+  - `llm_caption_node.py` : `extract_response_text()` の本文なし時の扱いを修正、`<think>` 関連コメントを実機挙動に合わせて更新
+- **不具合の内容**:
+  - ノード実行時、パース失敗が常に `応答が短すぎます (0文字)` になり原因が特定できなかった
+  - **原因**: 5章実装時は「thinking は `content` の先頭にインラインで `<think>...</think>` として入る」と観測していたが、実機を再確認したところ**現在は `message.reasoning_content` に分離され、`content` には `<think>` が入らない**。そのため `content` が空（＝本文が1文字も生成されていない）の場合に 5章のデバッグ用フォールバック `<think>{reasoning_content}</think>` が返り、6章の `strip_thinking()` が `</think>` 以降だけを取るため**必ず空文字**になっていた
+  - 本来「max_tokens不足で本文未生成」と分かるべきエラーが、5章のフォールバックと6章のパースの組み合わせで無意味なメッセージに化けていた
 - **変更内容**:
-  - `list_system_prompt_files()` を追加。`system_prompts/`（ノード自身のディレクトリ基準）内の `.txt` ファイル名一覧をソートして返す。フォルダ不在・読み取り不可時は例外を握りつぶして空リストを返す
-  - `read_system_prompt_file(filename)` を追加。指定ファイルの中身をUTF-8でそのまま読み込んで返す
-  - `INPUT_TYPES` に `system_prompt_file` コンボボックスを追加。候補が0件の場合は `"(no .txt files found in system_prompts/)"` にフォールバック
-  - `generate()` は `system_prompt_file` を受け取り中身を読み込むところまで実装。LLMメッセージ構築（5章）へはまだ組み込んでいない（ダミー出力に文字数だけ含めて動作確認）
+  - `extract_response_text()` : `content` が空のときに `reasoning_content` を `<think>` で包んで返すフォールバックを廃止。代わりに `choices[0].finish_reason` を見て `CaptionParseError` を理由付きで送出
+    - `finish_reason == "length"` → `max_tokens に達したため本文が生成されませんでした（thinking で N 文字を消費）。max_tokens を増やすか enable_thinking を OFF にしてください`
+    - それ以外 → `モデルが本文を返しませんでした (finish_reason=..., thinking N 文字)`
+  - `strip_thinking()` / `THINK_CLOSE_TAG` : 実機では通常ノーオペになる旨と、インライン `<think>` を返す他サーバー／モデル向けの保険として残す旨をコメントに明記
 - **備考**:
-  - モデル一覧と同様、ファイル一覧・中身の読み込みは `INPUT_TYPES`／`generate()` 呼び出しのたびに実行されるため、`.txt` の追加・編集はComfyUIサーバー再起動なしでも次回実行時に反映される（ただしコンボボックスの選択肢自体は他ウィジェットと同じくF5リロードが必要）
-  - 5〜6章（LLM呼び出し本体・出力パース）は今回未着手
+  - **実機で再確認したAPI仕様（タスク3の備考を上書き）**: `gemma-4-26B-A4B-it-QAT-GGUF` は thinking を `message.reasoning_content` に分離して返す。`content` にインラインの `<think>` は含まれない
+  - 実測値: 同一入力で `max_tokens=8192` → `finish_reason: stop` / completion 1197トークン（`content` 238文字、`reasoning_content` 4045文字）。`max_tokens=200` → `finish_reason: length` / `content` 0文字
+  - 検証4ケース: トークン切れ／正常／`content`空+`finish_reason=stop`／インライン`<think>`（保険経路）すべて期待どおり
+  - `.py` の変更のためブラウザF5では反映されず、ComfyUIサーバーの再起動が必要
+  - 例外は現状そのまま上位へ伝播する（リトライ・ログ出力は7章のため引き続き未実装）
+
+---
+
+## タスク6: デバッグ用コンソールログの整備（設定値サマリ行の追加）
+
+- **完了日**: 2026-08-23
+- **動作確認**: ✅済み（実機Lemonade Server `192.168.85.57:13305` / `gemma-4-26B-A4B-it-QAT-GGUF` / 2枚バッチ・`both` モードで出力を確認）
+- **新規ファイル**: なし
+- **修正ファイル**:
+  - `llm_caption_node.py` : `generate()` に設定値サマリ行を追加、画像ごとの進捗行を簡易化
+  - `LLM_Caption_Node_指示書.md` : 7.4.1 を新設、12章チェックリストに1項目追加
+- **背景**:
+  - タスク5の不具合（`max_tokens` 不足による本文未生成）のように、**送信パラメータが分からないと切り分けができない**ケースがあったため、実行時の設定値をコンソールに残すようにした
+- **変更内容（コード）**:
+  - `generate()` のループ**前**に、実行開始時1回だけ設定値サマリを出力
+    - 出力項目: 画像枚数 / `model` / `enable_thinking` / `temperature` / `top_p`（内部固定値 `FIXED_TOP_P`。UIに出ないため明示） / `max_tokens` / `timeout_sec`
+    - バッチ内でこれらの値は不変のため、画像ごとには出力しない（100枚処理で同じ設定が100回出るのを避ける）
+  - 画像ごとの進捗行から `model` を削除し `(size=WxH)` のみの簡易表示に変更（サマリ行と重複するため）
+  - 「7.4のコンソール出力簡略化を行う際もこの行は残すこと」をコード上のコメントにも明記
+- **変更内容（指示書）**:
+  - `### 7.4 コンソール出力` の直下に `#### 7.4.1 設定値サマリ行（デバッグ用・必須）` を新設。出力例・出力項目・画像ごとに出さない理由を記載
+  - 7.4.1 に **「7章のコンソール出力簡略化を実装する際も削除・省略しないこと」を「重要」として明記**（`max_tokens` 不足による本文未生成の切り分けに必須であった経緯も併記）
+  - 12章チェックリストに `- [ ] 実行開始時に設定値サマリ行（枚数/model/thinking/temperature/top_p/max_tokens/timeout）が1回だけ出力される（7.4.1）` を追加
+- **実際の出力例**:
+  ```
+  [LLMCaptionGenerator] 開始: 2枚, model=gemma-4-26B-A4B-it-QAT-GGUF, thinking=False, temp=0.3, top_p=1.0, max_tokens=8192, timeout=600s
+  [LLMCaptionGenerator] 1/2 送信中 (size=1024x768)
+  [LLMCaptionGenerator] 2/2 送信中 (size=1024x768)
+  ```
+- **備考**:
+  - 7章実装時にこの行が消されないよう、指示書7.4.1 / 12章チェックリスト / コード内コメントの**3箇所**に根拠を残してある
+  - 7章（リトライ・エラーハンドリング・ログファイル出力）は引き続き未着手。7.4のコンソール出力簡略化もこれから
+
+---
