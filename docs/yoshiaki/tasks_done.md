@@ -420,3 +420,47 @@
   - Lemonade Server内部の約5分タイムアウトは引き続きクライアント側からは変更できない
 
 ---
+
+## タスク13: 指示書13.5「接続切断による暗黙的キャンセル」実装（v11.7.0対応）
+
+- **完了日**: 2026-08-23
+- **動作確認**: ✅済み（CPythonソースでのクローズ経路確認＋ソケットリーク検査＋実機タイムアウトのログ確認＋バックエンド停止の間接測定）
+- **新規ファイル**: なし
+- **修正ファイル**:
+  - `llm_caption_node.py` : `request_chat_completion()` の接続クローズを明示化、`CONNECTION_ABORTED` ログを追加
+  - `LLM_Caption_Node_指示書.md` : 13.5.4「実装結果」を新設
+- **サーバー状況の確認**:
+  - `GET /api/v1/health` → **`"version":"11.7.0"`。既にアップデート済みだった**
+  - v11.7.0 でも `POST /api/v1/requests/{id}/cancel` `POST /v1/requests/{id}/cancel` `/api/v1/cancel` `/api/v1/halt` `/api/v1/stop` `/v1/chat/completions/{id}/cancel` `/openapi.json` はすべて404。**正式なキャンセルAPIは未提供のまま**（指示書13.1の記述どおり）。`LEMONADE_CANCEL_PATH` は空文字のまま維持
+- **変更内容（13.5.1）**:
+  - 指示書は `requests` / `httpx` を前提に書かれているが、**本ノードは標準ライブラリの `urllib`（非ストリーミング）を使用**しているため、そちらでクローズを確認・保証した
+  - `request_chat_completion()` を `with urllib.request.urlopen(...)` から `try/finally` 構成に変更し、`finally: response.close()` で明示クローズするようにした
+  - CPython の `urllib/request.py` `AbstractHTTPHandler.do_open` を読んで2経路とも閉じられることを確認し、根拠をコードコメントに残した
+    - **応答ヘッダ待ちでのタイムアウト（Thinkモードの長いprefillはこの経路）** → `h.getresponse()` の例外を `except: h.close(); raise` が捕捉してソケットを即クローズ
+    - **ヘッダ受信後の `read()` 中のタイムアウト** → `do_open` が既に `h.sock.close()` 済み。残る `HTTPResponse` を実装側の `finally` で閉じる
+  - 将来ストリーミングに変更する場合もこの `finally` は必須である旨をコメントに明記
+- **変更内容（13.5.2）**:
+  - タイムアウト検知時、**キャンセルAPI呼び出しより先に** `CONNECTION_ABORTED` を記録するよう順序を変更（13.5.1の処理順序に準拠）
+  - 記録例: `CONNECTION_ABORTED: melte0001.png reason=timeout note=prefill_cancel_supported_v11.7+`
+  - `LEMONADE_CANCEL_PATH` 未設定時は従来どおり `CANCEL_SKIPPED ... reason=no_endpoint_configured` も併記され、**どちらのキャンセル手段が働いたか後から判別できる**
+- **検証結果**:
+  - **ソケットリーク検査**: タイムアウトを3回連続で発生させ、開いているソケット数が 前=0／後=0 で変化しないことを確認
+  - **実機タイムアウト（`timeout_sec=1`）の `log.log`**:
+    ```
+    CONNECTION_ABORTED: melte0001.png reason=timeout note=prefill_cancel_supported_v11.7+
+    CANCEL_SKIPPED request_id=521b051e-... reason=no_endpoint_configured
+    RETRY: melte0001.png attempt=1/3 max_tokens=8192 temperature=0.3 reason=timeout detail=timed out
+    ```
+    3試行とも同じ順序で記録され、13.2のパラメータ調整（8192/0.3 → 4096/0.5 → 2048/0.7）も併存して動作
+  - **バックエンド停止の間接測定（13.5.3の3項目め）**: 長い生成を投げて3秒で切断し、直後に短いリクエストの応答時間を測定
+    | 条件 | 応答時間 |
+    |---|---|
+    | アイドル時の基準（4回） | 0.24 / 0.24 / 0.24 / 0.25 秒 |
+    | 切断直後（3回） | **1.49 / 1.01 / 52.80 秒** |
+    - 切断後もバックエンドが `max_tokens=8192` を生成し続けていれば約160秒（実測50 tok/s換算）塞がるはずで、**3回中2回が約1〜1.5秒で復帰したことから、接続切断でバックエンド側の生成も中断されていると判断できる**
+    - ただし1回だけ52.80秒かかっており、原因特定にはサーバー側のログ・GPU使用率の確認が必要。**本ノード側からは確認できないため未検証のまま残した**（指示書13.5.4にも明記）
+- **備考**:
+  - 13.1〜13.4 のキャンセルAPI呼び出しの仕組みはそのまま維持しており、将来 `LEMONADE_CANCEL_PATH` にパスを設定すれば二重措置として機能する
+  - 「指示書の3.5」とのご指示だったが、3章に3.5は存在せず内容が一致する **13.5** として実装した
+
+---

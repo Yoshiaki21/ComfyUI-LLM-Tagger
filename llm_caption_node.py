@@ -225,8 +225,22 @@ def request_chat_completion(host, port, api_key, payload, timeout_sec, request_i
 
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+
+    # 13.5.1 タイムアウト時に確実にTCP接続をクローズし、切断をサーバー側へ伝えること。
+    # 本ノードは urllib（非ストリーミング）を使用しており、以下2経路とも接続が閉じられることを
+    # CPython の urllib/request.py `AbstractHTTPHandler.do_open` のソースで確認済み：
+    #   1) 応答ヘッダ待ちでのタイムアウト（Thinkモードの長いprefillはこちら）
+    #      → h.getresponse() の例外を `except: h.close(); raise` が捕捉しソケットを閉じる
+    #   2) ヘッダ受信後の read() 中のタイムアウト
+    #      → do_open が既に `h.sock.close()` 済み。残る HTTPResponse を下の finally で閉じる
+    # 将来ストリーミング（stream=True 相当）に変更する場合も、この finally の明示クローズは必須。
+    response = None
+    try:
+        response = urllib.request.urlopen(request, timeout=timeout_sec)
         return json.loads(response.read().decode("utf-8"))
+    finally:
+        if response is not None:
+            response.close()
 
 
 def extract_response_text(response_payload):
@@ -718,8 +732,15 @@ class LLMCaptionGenerator:
                     break
                 except RETRYABLE_EXCEPTIONS as e:
                     reason = classify_error(e)
-                    # 13.1 タイムアウト時はサーバー側の生成を明示的に中断させる（ベストエフォート）
                     if reason == "timeout":
+                        # 13.5 HTTP接続の切断そのものがキャンセル手段として機能する。
+                        # Lemonade Server v11.7.0 の PR #3133 により、prefill中（初トークン
+                        # 生成前）の切断も上流リクエストへ伝わり生成が中断される。
+                        # 接続は request_chat_completion() の finally で確実に閉じている。
+                        write_log(log_dir,
+                                  f"CONNECTION_ABORTED: {label} reason=timeout "
+                                  f"note=prefill_cancel_supported_v11.7+")
+                        # 13.5.1 その上で、正式なキャンセルAPIが設定されていれば保険として呼ぶ
                         cancel_request(log_dir, lemonade_host, lemonade_port,
                                        lemonade_api_key, request_id)
                     # 13.2 接続失敗ではパラメータ調整に意味がないため元の値のまま再試行する
