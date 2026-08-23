@@ -7,7 +7,6 @@ curl -s http://lemonade:13305/api/v1/models | jq -r '.data[].id'
 curl -s http://192.168.85.57:13305/api/v1/models | jq -r '.data[].id'
 
 2026/08/17
-claude --resume 73c97efd-b3be-4581-be49-07f423cae57f
 
 [LLMCaptionGenerator] 1/1 送信中 (size=1024x694, model=gemma-4-26B-A4B-it-QAT-GGUF)
 
@@ -15,3 +14,6 @@ max_tokens
 timeout_sec
 enable_thinking
 temperature
+
+2026/08/23
+claude --resume d22fa946-512d-4f5a-9183-ee3886c5560b
