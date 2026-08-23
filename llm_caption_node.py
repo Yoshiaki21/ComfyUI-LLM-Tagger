@@ -70,18 +70,46 @@ LOG_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 LEMONADE_CANCEL_PATH = ""
 CANCEL_TIMEOUT_SEC = 5
 
+# 7.1 / 6.3 リトライ対象の失敗分類
+REASON_CONNECTION = "connection"
+REASON_TIMEOUT = "timeout"
+REASON_PARSE_LENGTH = "parse_length"
+REASON_PARSE_FORMAT = "parse_format"
+# 13.2 の縮小方向の調整を適用する分類（それ以外はパラメータを据え置く）
+SHRINK_REASONS = (REASON_TIMEOUT, REASON_PARSE_FORMAT)
+
 # 13.2 リトライ時のパラメータ調整（インデックスは 試行回数-1）。ウィジェットには公開しない。
 # 2回目は max_tokens 半分・temperature +0.2、3回目は 1/4・+0.4。下限/上限でクリップする。
 RETRY_MAX_TOKENS_SCALE = (1.0, 0.5, 0.25)
 RETRY_MAX_TOKENS_FLOOR = (0, 512, 256)
 RETRY_TEMPERATURE_DELTA = (0.0, 0.2, 0.4)
 RETRY_TEMPERATURE_CEILING = 1.0
-# 13.2 接続失敗はパラメータ調整に意味がないため、この理由のリトライでは元の値のまま再試行する
-NO_PARAM_ADJUST_REASONS = ("connection_failed",)
+
+# 13.6 parse_length（finish_reason=="length"）時は max_tokens を直前の2倍にして再試行する
+RETRY_MAX_TOKENS_GROWTH = 2
+# 13.6.1 クランプ後もこれを下回らせない
+MIN_MAX_TOKENS = 256
+# 13.6.1 プロンプト側トークン数の概算。usage.prompt_tokens が取れる場合はそちらを優先する
+CHARS_PER_TOKEN_ESTIMATE = 4
+IMAGE_PROMPT_TOKENS_ESTIMATE = 1024
+# 13.6.1 max_context_window ぎりぎりを避けるための余裕
+CONTEXT_SAFETY_MARGIN_TOKENS = 256
+CLAMP_LOG_NOTE = "note=clamped_by_max_context_window"
+
+# 3章のモデル一覧取得時に拾う max_context_window のキャッシュ（13.6.1のクランプに使う）
+MODEL_CONTEXT_WINDOWS = {}
 
 
 class CaptionParseError(Exception):
-    """6.2 応答不正。7.1 のリトライ対象。"""
+    """6.2 応答不正。7.1 のリトライ対象。
+
+    category には 6.3 の分類（parse_length / parse_format）を持たせ、
+    13.2（縮小）と 13.6（増量）のどちらへ分岐するかの判断に使う。
+    """
+
+    def __init__(self, message, category=REASON_PARSE_FORMAT):
+        super().__init__(message)
+        self.category = category
 
 
 def build_lemonade_base_url(host, port):
@@ -106,8 +134,28 @@ def fetch_lemonade_models(host=DEFAULT_LEMONADE_HOST, port=DEFAULT_LEMONADE_PORT
         return []
 
     entries = payload.get("data", []) if isinstance(payload, dict) else []
-    model_ids = [entry["id"] for entry in entries if isinstance(entry, dict) and entry.get("id")]
+    model_ids = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        model_ids.append(entry["id"])
+        # 13.6.1 の上限クランプで使うためコンテキスト長も保持しておく
+        window = entry.get("max_context_window")
+        if isinstance(window, int) and window > 0:
+            MODEL_CONTEXT_WINDOWS[entry["id"]] = window
     return model_ids
+
+
+def get_model_context_window(host, port, api_key, model):
+    # 13.6.1 クランプ用の max_context_window。3章のモデル一覧取得時のキャッシュを使い、
+    # 未取得なら一度だけ取りに行く。取得できなければ None を返し、その場合クランプは行わない。
+    if model in MODEL_CONTEXT_WINDOWS:
+        return MODEL_CONTEXT_WINDOWS[model]
+
+    fetch_lemonade_models(host, port, api_key)
+    # 取得できなかった場合も None をキャッシュし、画像ごとに再取得しにいかないようにする
+    MODEL_CONTEXT_WINDOWS.setdefault(model, None)
+    return MODEL_CONTEXT_WINDOWS[model]
 
 
 def list_system_prompt_files():
@@ -257,14 +305,16 @@ def extract_response_text(response_payload):
     finish_reason = choice.get("finish_reason")
     thinking_chars = len((message.get("reasoning_content") or "").strip())
     if finish_reason == "length":
+        # 6.3 parse_length。13.6 の max_tokens 増量で回復を狙う
         raise CaptionParseError(
             f"max_tokens に達したため本文が生成されませんでした"
-            f"（thinking で {thinking_chars} 文字を消費）。"
-            f"max_tokens を増やすか enable_thinking を OFF にしてください"
+            f"（thinking で {thinking_chars} 文字を消費）",
+            REASON_PARSE_LENGTH,
         )
     raise CaptionParseError(
         f"モデルが本文を返しませんでした (finish_reason={finish_reason}, "
-        f"thinking {thinking_chars} 文字)"
+        f"thinking {thinking_chars} 文字)",
+        REASON_PARSE_FORMAT,
     )
 
 
@@ -320,9 +370,34 @@ def combine_both_output(tags_part, caption_part, trigger_word):
     return f"{tag_line}{TAGS_CAPTION_DELIMITER}{caption_part}"
 
 
-def parse_response(raw_response, output_mode, trigger_word):
-    # 6章 パース本体。失敗時は CaptionParseError を送出する（7章のリトライ処理は未実装のため、
-    # 現状は例外がそのまま呼び出し元へ伝播する）。
+def classify_parse_failure(response_payload, requested_max_tokens):
+    # 6.3 パース失敗の理由を finish_reason で分類する（"---" の有無だけで判定しない）。
+    choices = response_payload.get("choices") or [{}]
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    if choice.get("finish_reason") == "length":
+        return REASON_PARSE_LENGTH
+
+    # usage が取れる場合は補強材料として使う（completion_tokens が max_tokens に張り付いていれば
+    # finish_reason が "stop" でも打ち切りとみなす）。usage 未対応サーバーでは finish_reason のみ。
+    usage = response_payload.get("usage") or {}
+    completion_tokens = usage.get("completion_tokens")
+    if (requested_max_tokens and isinstance(completion_tokens, (int, float))
+            and completion_tokens >= requested_max_tokens):
+        return REASON_PARSE_LENGTH
+    return REASON_PARSE_FORMAT
+
+
+def parse_response(raw_response, output_mode, trigger_word, failure_category=REASON_PARSE_FORMAT):
+    # 6章 パース本体。失敗時は CaptionParseError を送出する（7.1 のリトライ対象）。
+    # failure_category には 6.3 の分類を渡し、送出する例外に付与する。
+    try:
+        return _parse_response_body(raw_response, output_mode, trigger_word)
+    except CaptionParseError as e:
+        e.category = failure_category
+        raise
+
+
+def _parse_response_body(raw_response, output_mode, trigger_word):
     body = strip_thinking(raw_response).strip()
     if len(body) < MIN_VALID_RESPONSE_CHARS:
         raise CaptionParseError(f"応答が短すぎます ({len(body)}文字): {body!r}")
@@ -466,28 +541,50 @@ def format_response_for_log(response_payload):
 
 
 def classify_error(error):
-    # 7.3/7.4 のログ・コンソール表示用の簡易理由
+    # 7.1 の4分類（connection / timeout / parse_length / parse_format）を返す。
+    # 4分類に当てはまらないもの（HTTPエラー・不正JSON等）は独自の名前を返し、
+    # パラメータ調整の対象外（据え置き）として扱う。
     if isinstance(error, CaptionParseError):
-        return "parse_error"
+        return getattr(error, "category", REASON_PARSE_FORMAT)
     if isinstance(error, urllib.error.HTTPError):
         return f"http_{error.code}"
     # 読み取りタイムアウトは TimeoutError、接続タイムアウトは URLError(reason=TimeoutError) で来る
     if isinstance(error, TimeoutError) or isinstance(getattr(error, "reason", None), TimeoutError):
-        return "timeout"
+        return REASON_TIMEOUT
     if isinstance(error, urllib.error.URLError):
-        return "connection_failed"
+        return REASON_CONNECTION
     if isinstance(error, (json.JSONDecodeError, KeyError, IndexError)):
         return "invalid_response"
     return type(error).__name__
 
 
-def adjust_retry_params(attempt, base_max_tokens, base_temperature, adjust=True):
-    # 13.2 暴走の再発防止。同一パラメータで即リトライすると同じ理由で再び暴走しうるため、
-    # 試行回数に応じて max_tokens を絞り temperature を上げる。
-    # adjust=False（接続失敗によるリトライ）のときは元の値のまま再試行する。
-    if not adjust or attempt <= 1:
-        return base_max_tokens, base_temperature
+def estimate_prompt_tokens(system_prompt_text, user_text, has_image=True):
+    # 13.6.1 プロンプト側トークン数の概算。厳密なトークナイザ計算は不要で、
+    # 「明らかに超過する組み合わせを避ける」ことが目的。
+    # 実応答の usage.prompt_tokens が取れる場合はそちらを優先する（呼び出し側で差し替える）。
+    chars = len(system_prompt_text or "") + len(user_text or "")
+    estimate = chars // CHARS_PER_TOKEN_ESTIMATE
+    if has_image:
+        # 画像はbase64の文字数ではなく画像トークンとして数えられるため固定値で見積もる
+        estimate += IMAGE_PROMPT_TOKENS_ESTIMATE
+    return estimate
 
+
+def clamp_max_tokens(desired_max_tokens, prompt_tokens, max_context_window):
+    # 13.6.1 「プロンプト側の推定トークン数 + max_tokens」が max_context_window を
+    # 超えないようクランプする。戻り値は (max_tokens, クランプしたか)。
+    if not max_context_window:
+        return desired_max_tokens, False
+
+    allowed = max_context_window - prompt_tokens - CONTEXT_SAFETY_MARGIN_TOKENS
+    allowed = max(MIN_MAX_TOKENS, allowed)
+    if desired_max_tokens > allowed:
+        return allowed, True
+    return desired_max_tokens, False
+
+
+def shrink_retry_params(attempt, base_max_tokens, base_temperature):
+    # 13.2 暴走の再発防止。表は「試行回数」で索く（基準はウィジェット設定値）。
     index = min(attempt - 1, len(RETRY_MAX_TOKENS_SCALE) - 1)
     scaled = int(base_max_tokens * RETRY_MAX_TOKENS_SCALE[index])
     # 下限でクリップしたうえで、元の設定値を超えないようにする
@@ -497,6 +594,31 @@ def adjust_retry_params(attempt, base_max_tokens, base_temperature, adjust=True)
     temperature = round(min(RETRY_TEMPERATURE_CEILING,
                             base_temperature + RETRY_TEMPERATURE_DELTA[index]), 2)
     return max_tokens, temperature
+
+
+def next_attempt_params(previous_reason, attempt, current_max_tokens, current_temperature,
+                        base_max_tokens, base_temperature, max_context_window, prompt_tokens):
+    """7.1 直前の試行の失敗理由で次の試行のパラメータを決める（固定の試行回数テーブルではない）。
+
+    戻り値は (max_tokens, temperature, クランプしたか)。
+    - parse_length            : 13.6 直前に使用した値の2倍（max_context_window でクランプ）
+    - timeout / parse_format  : 13.2 の縮小テーブル（試行回数で索く。基準はウィジェット設定値）
+    - connection / その他     : 調整なし（直前に使用した値のまま再試行）
+    """
+    if attempt <= 1:
+        return base_max_tokens, base_temperature, False
+
+    if previous_reason == REASON_PARSE_LENGTH:
+        desired = current_max_tokens * RETRY_MAX_TOKENS_GROWTH
+        max_tokens, clamped = clamp_max_tokens(desired, prompt_tokens, max_context_window)
+        # 13.6 は max_tokens のみを調整し temperature は据え置く
+        return max_tokens, current_temperature, clamped
+
+    if previous_reason in SHRINK_REASONS:
+        max_tokens, temperature = shrink_retry_params(attempt, base_max_tokens, base_temperature)
+        return max_tokens, temperature, False
+
+    return current_max_tokens, current_temperature, False
 
 
 def cancel_request(log_dir, host, port, api_key, request_id):
@@ -558,9 +680,14 @@ class LLMCaptionGenerator:
                 "model": (model_list,),
                 "enable_thinking": ("BOOLEAN", {"default": True}),
                 "temperature": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 2.0, "step": 0.05}),
-                # enable_thinking=True では thinking だけで4000トークン超を消費する実測値があるため、
-                # 指示書の目安(2048)より大きめの既定値にしている（不足すると本体が出力されず応答不正になる）
-                "max_tokens": ("INT", {"default": 8192, "min": 1, "max": 32768}),
+                # 13.6 これは固定の生成上限ではなく「自動増量の初期値」。
+                # finish_reason=="length"（parse_length）で失敗すると次の試行で倍増する。
+                "max_tokens": ("INT", {
+                    "default": 8192, "min": 1, "max": 32768,
+                    "tooltip": "生成トークン数の初期値。応答が尻切れ(finish_reason=length)に"
+                               "なった場合、リトライで自動的に倍増します"
+                               "（モデルの max_context_window でクランプ）。",
+                }),
                 "timeout_sec": ("INT", {"default": 120, "min": 1, "max": 3600}),
                 # 8章 ON にすると IS_CHANGED が毎回異なる値を返しキャッシュを無効化する
                 "always_regenerate": ("BOOLEAN", {"default": False}),
@@ -668,6 +795,11 @@ class LLMCaptionGenerator:
             print(f"[LLMCaptionGenerator] {warning}")
             write_log(log_dir, warning)
 
+        # 13.6.1 上限クランプ用のコンテキスト長。バッチ内で不変なのでここで1回だけ解決する
+        max_context_window = get_model_context_window(
+            lemonade_host, lemonade_port, lemonade_api_key, model
+        )
+
         results = []
         success_count = 0
         for index, image_tensor in enumerate(images, start=1):
@@ -698,13 +830,20 @@ class LLMCaptionGenerator:
                     f"{user_text}\n{describe_image_part(pil_image, image_base64)}",
                 )
 
-            # 7.1 接続失敗・タイムアウト・パース失敗を同一カウンタで最大 MAX_ATTEMPTS 回試行
+            # 7.1 4分類（connection / timeout / parse_length / parse_format）を
+            # 同一カウンタで最大 MAX_ATTEMPTS 回試行する
             caption = ""
-            # 13.2 直前の失敗理由に応じて次の試行のパラメータを調整するかどうかを決める
-            adjust_next_attempt = True
+            # 13.6.1 クランプに使うプロンプト側トークン数。応答の usage が取れたら実測値へ差し替える
+            prompt_tokens = estimate_prompt_tokens(
+                system_prompt_text, build_user_text(image_tags, trigger_word)
+            )
+            attempt_max_tokens, attempt_temperature, attempt_clamped = max_tokens, temperature, False
+            # 7.1 直前の試行の失敗理由に応じて次の試行のパラメータを分岐させる
+            previous_reason = None
             for attempt in range(1, MAX_ATTEMPTS + 1):
-                attempt_max_tokens, attempt_temperature = adjust_retry_params(
-                    attempt, max_tokens, temperature, adjust_next_attempt
+                attempt_max_tokens, attempt_temperature, attempt_clamped = next_attempt_params(
+                    previous_reason, attempt, attempt_max_tokens, attempt_temperature,
+                    max_tokens, temperature, max_context_window, prompt_tokens
                 )
                 payload = build_chat_payload(model, messages, enable_thinking,
                                              attempt_temperature, attempt_max_tokens)
@@ -717,6 +856,10 @@ class LLMCaptionGenerator:
                         request_id=request_id
                     )
                     elapsed = time.monotonic() - request_started
+                    # 13.6.1 実測のプロンプトトークン数が取れれば概算より優先する
+                    actual_prompt_tokens = (response_payload.get("usage") or {}).get("prompt_tokens")
+                    if isinstance(actual_prompt_tokens, int) and actual_prompt_tokens > 0:
+                        prompt_tokens = actual_prompt_tokens
                     if log_prompt:
                         timing = format_response_timing(elapsed, response_payload)
                         write_prompt_log(
@@ -726,13 +869,17 @@ class LLMCaptionGenerator:
                             format_response_for_log(response_payload),
                         )
                     raw_response = extract_response_text(response_payload)
-                    caption = parse_response(raw_response, output_mode, trigger_word)
+                    # 6.3 パース失敗時にどちらの分類として扱うかを finish_reason から決めておく
+                    failure_category = classify_parse_failure(response_payload, attempt_max_tokens)
+                    caption = parse_response(raw_response, output_mode, trigger_word,
+                                             failure_category)
                     write_log(log_dir, f"SUCCESS: {label} mode={output_mode} attempt={attempt}")
                     success_count += 1
                     break
                 except RETRYABLE_EXCEPTIONS as e:
                     reason = classify_error(e)
-                    if reason == "timeout":
+                    previous_reason = reason
+                    if reason == REASON_TIMEOUT:
                         # 13.5 HTTP接続の切断そのものがキャンセル手段として機能する。
                         # Lemonade Server v11.7.0 の PR #3133 により、prefill中（初トークン
                         # 生成前）の切断も上流リクエストへ伝わり生成が中断される。
@@ -743,13 +890,13 @@ class LLMCaptionGenerator:
                         # 13.5.1 その上で、正式なキャンセルAPIが設定されていれば保険として呼ぶ
                         cancel_request(log_dir, lemonade_host, lemonade_port,
                                        lemonade_api_key, request_id)
-                    # 13.2 接続失敗ではパラメータ調整に意味がないため元の値のまま再試行する
-                    adjust_next_attempt = reason not in NO_PARAM_ADJUST_REASONS
-                    # 13.3 各試行で実際に使用したパラメータを記録する
+                    # 13.3 / 13.6.2 各試行で実際に使用したパラメータと分類を記録する。
+                    # クランプが発生した試行には note= を付記する。
+                    clamp_note = f" {CLAMP_LOG_NOTE}" if attempt_clamped else ""
                     write_log(log_dir,
                               f"RETRY: {label} attempt={attempt}/{MAX_ATTEMPTS} "
                               f"max_tokens={attempt_max_tokens} temperature={attempt_temperature} "
-                              f"reason={reason} detail={e}")
+                              f"reason={reason}{clamp_note} detail={e}")
                     if attempt == MAX_ATTEMPTS:
                         # 7.4 コンソールはファイル名＋簡易理由のみ。詳細はログファイル参照
                         print(f"[LLMCaptionGenerator] SKIPPED: {label} ({reason})")

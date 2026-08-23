@@ -464,3 +464,55 @@
   - 「指示書の3.5」とのご指示だったが、3章に3.5は存在せず内容が一致する **13.5** として実装した
 
 ---
+
+## タスク14: 指示書6.3・7.1・13.2・13.6「finish_reasonによる分類とリトライ分岐化」実装
+
+- **完了日**: 2026-08-23
+- **動作確認**: ✅済み（分類・クランプの単体テスト＋5シナリオの分岐テスト＋実機で `finish_reason=="length"` を発生させた倍増確認）
+- **新規ファイル**: なし
+- **修正ファイル**:
+  - `llm_caption_node.py` : 失敗分類の4分類化、リトライの分岐ロジック化、`max_tokens` 自動増量とクランプ、ログ更新
+  - `LLM_Caption_Node_指示書.md` : 13.6.4「実装結果」を新設
+- **変更内容（6.3 finish_reason による分類）**:
+  - `CaptionParseError` に `category` 属性を追加（既定 `parse_format`）
+  - `classify_parse_failure(response_payload, requested_max_tokens)` を追加。`finish_reason == "length"` → `parse_length`。加えて **`usage.completion_tokens >= 要求max_tokens` なら `finish_reason == "stop"` でも `parse_length`** とみなす（6.3の補強材料）。`usage` 未対応サーバーでは `finish_reason` のみで判定
+  - `parse_response()` に `failure_category` 引数を追加し、内部で送出される例外に分類を付与する構造にした（本体は `_parse_response_body()` へ分離）
+  - `extract_response_text()` の「本文なし」例外も `finish_reason` に応じて `parse_length` / `parse_format` を付与
+- **変更内容（7.1 分類名の統一）**:
+  - `classify_error()` が返す名前を4分類に統一: `connection`（旧 `connection_failed`）/ `timeout` / `parse_length` / `parse_format`（旧 `parse_error`）
+  - 4分類に当てはまらないもの（`http_{code}` / `invalid_response`）は独自名を返し、**パラメータ調整の対象外（据え置き）**として扱う
+- **変更内容（13.2/13.6 リトライの分岐化）**:
+  - 固定テーブル方式の `adjust_retry_params()` を廃止し、**直前の試行の失敗理由で分岐する** `next_attempt_params()` に置き換え
+    - `parse_length` → 13.6：直前に使用した値の**2倍**（`temperature` は据え置き）
+    - `timeout` / `parse_format` → 13.2：`shrink_retry_params()`（表を試行回数で索く。基準はウィジェット設定値）
+    - `connection` ほか → 調整なし（直前に使用した値のまま再試行）
+  - リトライ予算は7.1どおり**4分類共有で合計3回**。`parse_length` 専用の別枠は設けていない
+- **変更内容（13.6.1 上限クランプ）**:
+  - `fetch_lemonade_models()` が `/v1/models` の `max_context_window` を `MODEL_CONTEXT_WINDOWS` にキャッシュするよう変更
+  - `get_model_context_window()` を追加。キャッシュミス時は1回だけ再取得し、取得できなければ `None` をキャッシュしてクランプを行わない（画像ごとの再取得を避ける）
+  - `estimate_prompt_tokens()` : テキスト文字数 ÷ 4 ＋ 画像分1024トークンの概算。**ただし応答の `usage.prompt_tokens` が取れた時点で実測値へ差し替える**（base64の文字数で数えると1MB≒25万トークン相当になり無意味なため、画像は固定値見積もりにした）
+  - `clamp_max_tokens()` : `max_context_window - プロンプト推定 - 256(余裕)` を上限とし、`MIN_MAX_TOKENS = 256` を下回らせない
+  - コンテキスト長はバッチ内で不変のため、`generate()` の画像ループ**前**に1回だけ解決する
+- **変更内容（2.1 ウィジェットの意味変更）**:
+  - `max_tokens` の名前・型・既定値（8192）は変更せず、**ツールチップを追加**して「初期値。尻切れ時に自動で倍増（`max_context_window` でクランプ）」の意味に更新
+- **変更内容（13.3/13.6.2 ログ）**:
+  - `RETRY` 行の `reason=` が4分類名になった
+  - クランプ発生時は同じ行に `note=clamped_by_max_context_window` を付記
+- **検証結果**:
+  | シナリオ | 各試行の `max_tokens` / `temperature` |
+  |---|---|
+  | `parse_length` ×3（window=32768, prompt=911） | `8192/0.3` → `16384/0.3` → **`31601/0.3`（クランプ）** |
+  | `parse_length` → `timeout` → 3回目 | `8192/0.3` → `16384/0.3` → **`2048/0.7`（13.2の縮小へ切替）** |
+  | `parse_format` ×3 | `8192/0.3` → `4096/0.5` → `2048/0.7` |
+  | `connection` ×3 | `8192/0.3` ×3（据え置き） |
+  | 1回目で成功 | `8192/0.3` のみ |
+  - 分類の単体テスト: `finish_reason=length` → `parse_length` / `stop`+区切りなし → `parse_format` / `stop` だが `completion==max_tokens` → `parse_length` / `usage`なし+`stop` → `parse_format`
+  - クランプの単体テスト: `desired=32768,window=32768` → `31601`(clamped) / `window=None` → クランプなし / `window=2000` → `833`（下限256は割らない）
+  - **実機検証**: `gemma-4-26B-A4B-it-QAT-GGUF` の `max_context_window` が **262144** としてサーバーから取得できることを確認。`max_tokens=8` を指定して実際に `finish_reason=="length"` を発生させ、**`8 → 16 → 32` と倍増**することを確認
+  - 13.5（接続切断まわり）のロジックは変更しておらず、`CONNECTION_ABORTED` → `CANCEL_SKIPPED` → `RETRY` の順序も従来どおり動作
+- **確認事項（指示書の記述の食い違い・要判断）**:
+  - 13.2の補足「1回目`parse_length`→2回目`timeout`となった場合、2回目のtimeout対応は本表の『2回目』の行を適用する」は、表が試行回数で索かれる設計と整合しない（2回目の試行が失敗したとき調整対象になるのは**3回目**の試行のため）
+  - 指示の「`timeout`/`parse_format` は**既存の13.2ロジック**を適用」と表の構造から、**表の行番号＝試行回数**（既存実装どおり）と解釈して実装した。上表の「`parse_length` → `timeout`」で3回目が `2048/0.7`（3回目の行）になっているのはこの解釈による
+  - もし「2回目の行（`4096/0.5`）」が正しい場合は、`shrink_retry_params()` の索引の取り方を1行変えるだけで切り替え可能
+
+---

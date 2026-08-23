@@ -43,7 +43,7 @@ LoRA Caption Load ──┬── image list ───────────�
 | `model` | `STRING`（コンボボックス、動的） | 必須 | Lemonade Server から取得したモデル一覧（詳細は3章） |
 | `enable_thinking` | `BOOLEAN` | 必須 | デフォルト `True`（常時ON運用想定だが切替可能にしておく） |
 | `temperature` | `FLOAT` | 必須 | デフォルト `0.3` 程度、範囲 0.0〜2.0 |
-| `max_tokens` | `INT` | 必須 | デフォルト `2048` 程度（Thinkトークン込みの想定でやや大きめ） |
+| `max_tokens` | `INT` | 必須 | **初期値**。デフォルト `8192`。13.2/13.6の自動増量ロジックの起点として使用する（ウィジェット値そのものを固定上限として使うわけではない） |
 | `timeout_sec` | `INT` | 必須 | デフォルト `120` |
 | `always_regenerate` | `BOOLEAN` | 必須 | ON時は `IS_CHANGED` で毎回キャッシュ無効化 |
 | `log_prompt` | `BOOLEAN` | 必須 | 既定 `False`。ON時のみ `logs/prompt.log` に送信内容と生応答を記録（7.3.1） |
@@ -143,16 +143,35 @@ LLM応答は以下のマーカー形式で返させることを前提にパー�
 ### 6.2 パース失敗時の扱い
 - `---` マーカーが見つからない、または期待される形式でない場合は**応答不正**とみなし、7章のリトライ処理に従う
 
+### 6.3 パース失敗の理由判定（`finish_reason` による分類）【2026-08-23 追加】
+
+パース失敗（6.2）は原因が異なる2種類が混在するため、レスポンスの `choices[0].finish_reason` を見て以下のように分類する。`---`区切りの有無だけで判定しない。
+
+| `finish_reason` | 分類 | 原因 |
+|---|---|---|
+| `"length"` | **`parse_length`** | `max_tokens`（または利用可能なコンテキスト残量）に達し、本文を書き終える前に強制打ち切りになった |
+| `"stop"` だが `---`区切りが無い等 | **`parse_format`** | 生成トークン数は足りているが、モデルが指示形式（PART1/PART2の区切り）を守らなかった |
+
+- `usage.completion_tokens` が取得できる場合、`max_tokens` にほぼ一致しているかを`parse_length`判定の補強材料として使ってよい（`usage`未対応サーバーでは`finish_reason`のみで判定する）
+- この分類は13.6のリトライ時パラメータ調整の分岐に使用する
+
 ---
 
 ## 7. エラーハンドリング・リトライ・ログ
 
 ### 7.1 リトライ対象（すべて同一カウントで統一）
-- Lemonade Server への接続失敗
-- タイムアウト（`timeout_sec` 超過）
-- 応答のパース失敗（6.2）
 
-→ **最大3回リトライ**。3回とも失敗した場合は該当画像を**スキップ**し、処理を継続する。
+リトライが必要な失敗は以下の4種類に分類する（6.3参照）。**カウントは4種類合わせて共有し、最大3回リトライ**。3回とも失敗した場合は該当画像を**スキップ**し、処理を継続する。
+
+| 分類 | 内容 | 13.6でのパラメータ調整方針 |
+|---|---|---|
+| `connection` | Lemonade Server への接続失敗 | 調整なし（元の値のまま再試行。13.2参照） |
+| `timeout` | タイムアウト（`timeout_sec` 超過） | `max_tokens`を縮小、temperatureを上昇（暴走対策・13.2） |
+| `parse_length` | 応答のパース失敗のうち `finish_reason == "length"` | `max_tokens`を倍増（13.6） |
+| `parse_format` | 応答のパース失敗のうち形式崩れ（`finish_reason == "stop"` 等、6.3参照） | `max_tokens`を縮小、temperatureを上昇（暴走対策・13.2） |
+
+- どの分類も**直前の試行の結果に基づいて次の調整を決める**（固定の試行回数テーブルではなく、都度分岐）。例：1回目`parse_length`→2回目`max_tokens`倍増→その結果2回目が`timeout`になった場合、3回目は13.2の縮小方向に切り替える
+- ログには分類名を`reason=`として記録する（13.3参照）
 
 ### 7.2 事前チェック（リトライ対象外・即スキップ）
 - `tags` が空文字の場合：LLM呼び出し自体を行わず、即座に失敗扱い・スキップ
@@ -392,6 +411,7 @@ Output ONLY the natural language description. No explanation, no extra text, no 
 - [ ] リトライ2回目・3回目で `max_tokens` が縮小、`temperature` が上昇していること（`log.log` の試行ごとの記録で確認）（13.2）
 - [ ] リトライ発生時、`log.log` に各試行で使用したパラメータ値が記録されていること（13.3）
 - [ ] タイムアウト時にHTTP接続が確実にクローズされ、`log.log` に `CONNECTION_ABORTED` が記録されること（13.5）
+- [ ] `finish_reason` による `parse_length` / `parse_format` の分類、および`parse_length`時の`max_tokens`自動増量（上限クランプ含む）が正しく動作すること（13.6、詳細は13.6.3）
 
 ---
 
@@ -428,18 +448,23 @@ Lemonade Server は Router からバックエンド（llama.cpp 等）への内�
 
 同一パラメータで即座にリトライすると、同じ理由で再び暴走・タイムアウトする可能性があるため、リトライ回数に応じてパラメータを段階的に調整する。
 
+> **【2026-08-23 適用範囲を修正】** 本節の表は失敗分類が **`timeout` または `parse_format`**（7.1・6.3参照）の場合にのみ適用する。**`parse_length`（`finish_reason=="length"`）の場合は本節ではなく13.6（`max_tokens`増量）を適用**する。`connection`の場合はどちらも適用せず元の値のまま再試行する。
+
 | 試行 | `max_tokens` | `temperature` |
 |---|---|---|
 | 1回目 | ウィジェット設定値そのまま | ウィジェット設定値そのまま |
 | 2回目 | 1回目の半分程度（下限を設ける。例：512） | +0.2（上限1.0程度でクリップ） |
 | 3回目 | 2回目の半分程度（下限を設ける。例：256） | +0.4（同上、上限でクリップ） |
 
+- 上表の「1回目/2回目/3回目」は**試行回数（何度目のLLM呼び出しか）を指し、失敗分類の連続を意味しない**。例えば1回目`parse_length`→2回目`timeout`となった場合、2回目のtimeout対応は本表の「2回目」の行（半減・+0.2）を適用する
 - 調整幅・下限/上限は**ウィジェットとして公開せず、コード内の定数として実装する**（設定項目の肥大化を避ける方針）。ただし将来調整しやすいよう、ファイル冒頭付近に定数としてまとめておくこと
 - この調整は **暴走対策が目的のタイムアウト・パース失敗時のリトライにのみ適用**する。接続失敗（サーバーそのものに到達できない）によるリトライでは、パラメータ調整に意味がないため元の値のまま再試行してよい
 
 ### 13.3 ログへの反映
 
-- `log.log` に、各試行で実際に使用した `max_tokens` / `temperature` を記録する（例：`[2026-08-23 14:02:11] RETRY: suzune_005.png attempt=2/3 max_tokens=512 temperature=0.5 reason=timeout`）
+- `log.log` に、各試行で実際に使用した `max_tokens` / `temperature` を記録する。`reason` には7.1の4分類（`connection` / `timeout` / `parse_length` / `parse_format`）のいずれかを記録する
+  - 例（timeoutで縮小）：`[2026-08-23 14:02:11] RETRY: suzune_005.png attempt=2/3 max_tokens=512 temperature=0.5 reason=timeout`
+  - 例（parse_lengthで増量、13.6）：`[2026-08-23 14:05:30] RETRY: suzune_008.png attempt=2/3 max_tokens=16384 temperature=0.3 reason=parse_length`
 - キャンセルAPIを呼び出した場合、その成否を記録する（例：`CANCEL_REQUEST_SENT request_id=xxxx` / `CANCEL_FAILED request_id=xxxx reason=...`）
 - `prompt.log`（7.3.1、`log_prompt` ON時）にも、リトライごとの `RESPONSE` 見出しに使用パラメータを付記する
 
@@ -497,4 +522,58 @@ Lemonade Server は v11.5.0 → v11.7.0 で以下の関連修正が入った：
   - **応答ヘッダ待ちでのタイムアウト（Thinkモードの長いprefillはこの経路）** → `h.getresponse()` の例外を `except: h.close(); raise` が捕捉し、ソケットを即座にクローズする
   - **ヘッダ受信後の `read()` 中のタイムアウト** → `do_open` が既に `h.sock.close()` 済み。残る `HTTPResponse` は実装側の `finally: response.close()` で明示的に閉じる
   - 実測でもタイムアウトを3回連続で発生させてソケットのリークが無いことを確認（開いているソケット数 前=0／後=0）
-- **バックエンド側の停止についての実測（13.5.3の3項目め）**：長い生成を投げて3秒で切断し、直後に短いリクエストの応答時間を測定した。アイドル時の基準値は0.24秒（4回とも0.24〜0.25秒）。切断直後は **1.49秒 / 1.01秒 / 52.80秒**（3回試行）。仮に切断後もバックエンドが `max_tokens=8192` を生成し続けていれば約160秒（実測50 tok/s換算）は塞がるはずで、**3回中2回は約1〜1.5秒で復帰したことから、接続切断によってバックエンド側の生成も中断されていると判断できる**。ただし1回だけ52.80秒かかっており、原因の特定にはサーバー側のログ・GPU使用率の確認が必要（本ノード側からは確認できないため未検証のまま残す）
+- **バックエンド側の停止についての実測（13.5.3の3項目め）**：長い生成を投げて3秒で切断し、直後に短いリクエストの応答時間を測定した。アイドル時の基準値は0.24秒（4回とも0.24〜0.25秒）。切断直後は **1.49秒 / 1.01秒 / 52.80秒**（3回試行）。仮に切断後もバックエンドが `max_tokens=8192` を生成し続けていれば約160秒（実測50 tok/s換算）は塞がるはずで、**3回中2回は約1〜1.5秒で復帰したことから、接続切断によってバックエンド側の生成も中断されていると判断できる**。ただし1回だけ52.80秒かかっており、原因の特定にはサーバー側のログ・GPU使用率の確認が必要（本ノード側からは確認できないため未検証のまま残す）。現状は暫定保留とし、実運用で暴走が多発するようなら改めて調査する
+
+---
+
+## 13.6 `max_tokens` 不足（`parse_length`）時の自動増量【2026-08-23 追加】
+
+### 背景
+
+`max_tokens` を小さくすると暴走（Thinkモードの発散）は抑えられるが、逆に「thinkingが長引いて本文を書き終える前に上限に達し、応答が尻切れになる」（`finish_reason == "length"`、6.3の`parse_length`）が起こりやすくなる。大きくすると暴走しやすくなる（13章）というトレードオフがあるため、**固定値ではなく「小さい値から始めて、尻切れが起きたときだけ増やす」方式**にする。
+
+### 13.6.1 実装方針
+
+- `max_tokens` ウィジェットの意味を「固定の生成上限」から**「初期値（自動増量の起点）」**に変更する。デフォルトは `8192`
+- 分類が `parse_length`（6.3）だった場合、次の試行では `max_tokens` を**直前に使用した値の2倍**にして再送する（13.2の縮小方向とは逆）
+  - 例：1回目 8192（`parse_length`）→ 2回目 16384 → それでも`parse_length`なら 3回目 32768
+- **上限クランプが必須**：3章でモデル一覧取得時に得られる `max_context_window`（そのモデルが対応する最大コンテキスト長）を用い、`max_tokens` が「プロンプト側の推定トークン数＋`max_tokens`」で `max_context_window` を超えないようクランプする。クランプが発生した場合、その試行の `max_tokens` はクランプ後の値を採用し、ログに `note=clamped_by_max_context_window` を付記する
+- プロンプト側の推定トークン数は厳密計算でなくてよい（文字数からの概算で可）。目的は「明らかに超過する組み合わせを避ける」ことであり、正確なトークナイザ一致は不要
+- リトライ予算は7.1の**合計3回を共有**する（`parse_length`専用の別枠は設けない）。増量後の試行が`timeout`や`parse_format`になった場合は、その時点で13.2の調整方針に切り替える（7.1参照）
+
+### 13.6.2 ログへの反映
+
+- 増量した試行は `log.log` に `reason=parse_length` として記録する（13.3の例を参照）
+- クランプが発生した場合は同じ行に `note=clamped_by_max_context_window` を付記する
+  ```
+  [2026-08-23 14:06:02] RETRY: suzune_010.png attempt=3/3 max_tokens=24576 temperature=0.3 reason=parse_length note=clamped_by_max_context_window
+  ```
+
+### 13.6.3 動作確認項目（12章チェックリストへの追加）
+
+- [ ] `finish_reason == "length"` を正しく`parse_length`として分類できること（6.3）
+- [ ] `parse_length`のリトライで`max_tokens`が直前の2倍になっていること
+- [ ] `max_context_window`を超える増量が発生した場合にクランプされ、ログに`note=clamped_by_max_context_window`が記録されること
+- [ ] `parse_length`増量後の試行が`timeout`になった場合、その回のみ13.2の縮小方向の調整に切り替わること（固定表ではなく直前の失敗理由で分岐していること）
+- [ ] `max_tokens`ウィジェットを未接続時のデフォルト値`8192`から自動増量が開始されること
+
+### 13.6.4 実装結果【2026-08-23 実装・検証済み】
+
+- **6.3の分類**：`CaptionParseError` に `category` を持たせ、`classify_parse_failure()` が `finish_reason` から `parse_length` / `parse_format` を決定する。`usage.completion_tokens >= 要求 max_tokens` の場合は `finish_reason == "stop"` でも `parse_length` とみなす（補強材料）。`usage` 未対応サーバーでは `finish_reason` のみで判定する
+- **分岐ロジック**：固定テーブル `adjust_retry_params()` を廃止し、直前の失敗理由で分岐する `next_attempt_params()` に置き換えた
+  - `parse_length` → 直前に使用した値の2倍（`clamp_max_tokens()` でクランプ）。`temperature` は据え置き
+  - `timeout` / `parse_format` → `shrink_retry_params()`（13.2の表を試行回数で索く。基準はウィジェット設定値）
+  - `connection`、およびHTTPエラー・不正JSONなど4分類外 → 調整なし（直前に使用した値のまま再試行）
+- **上限クランプ**：3章の `/v1/models` 取得時に `max_context_window` を `MODEL_CONTEXT_WINDOWS` にキャッシュし、`get_model_context_window()` で解決する（未取得なら1回だけ再取得、失敗時は `None` を返しクランプしない）。プロンプト側トークン数は **応答の `usage.prompt_tokens` が取れればそれを優先**し、無ければ「テキスト文字数÷4 ＋ 画像分1024トークン」の概算を使う。`CONTEXT_SAFETY_MARGIN_TOKENS = 256` の余裕を引く
+- **実測値**：`gemma-4-26B-A4B-it-QAT-GGUF` の `max_context_window` は **262144**（サーバーから取得）
+- **検証結果**：
+  | シナリオ | 各試行の `max_tokens` / `temperature` |
+  |---|---|
+  | `parse_length` ×3（window=32768, prompt=911） | `8192/0.3` → `16384/0.3` → **`31601/0.3`（クランプ）** |
+  | `parse_length` → `timeout` → 3回目 | `8192/0.3` → `16384/0.3` → **`2048/0.7`（13.2の縮小へ切替）** |
+  | `parse_format` ×3 | `8192/0.3` → `4096/0.5` → `2048/0.7` |
+  | `connection` ×3 | `8192/0.3` ×3（据え置き） |
+  | 1回目で成功 | `8192/0.3` のみ（リトライなし） |
+  - クランプ発生時のログ：`RETRY: a.png attempt=3/3 max_tokens=31601 temperature=0.3 reason=parse_length note=clamped_by_max_context_window detail=...`
+  - **実機検証**：`max_tokens=8` を指定して実際に `finish_reason == "length"` を発生させ、`8 → 16 → 32` と倍増することを確認（`reason=parse_length`）
+- **13.2の表の索き方について**：13.2の補足にある「1回目`parse_length`→2回目`timeout`の場合、本表の『2回目』の行を適用」という記述は、表が試行回数で索かれる設計と整合しない（2回目の試行が失敗したとき調整対象になるのは3回目の試行のため）。**表の行番号＝試行回数**（＝既存実装どおり）と解釈して実装した。上表の「`parse_length` → `timeout` → 3回目」で3回目が `2048/0.7`（3回目の行）になっているのはこの解釈による
