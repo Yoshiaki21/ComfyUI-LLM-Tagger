@@ -1,5 +1,6 @@
 import base64
 import datetime
+import http.client
 import io
 import json
 import os
@@ -35,6 +36,16 @@ IMAGE_MIME_TYPE = "image/png"
 
 # 5.3 top_p は内部固定値
 FIXED_TOP_P = 1.0
+
+# 13.5 リクエストはストリーミングで送る。
+# Lemonade Server は「クライアントへ書き込む際に接続をポーリングする」実装（v11.7.0 PR #3133）
+# のため、非ストリーミングだと生成フェーズでの切断がサーバーへ伝わらず、打ち切ったはずの生成が
+# 最後まで走り続ける（実機で 4/4 再現。stream=True では 4/4 即解放）。
+CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
+SSE_DATA_PREFIX = "data:"
+SSE_DONE_MARKER = "[DONE]"
+# HTTPエラー時に読み取る本文の上限
+MAX_ERROR_BODY_BYTES = 2048
 
 # 6章 出力パース
 # 実機の Lemonade Server は thinking を message.reasoning_content に分離して返し、
@@ -292,13 +303,85 @@ def build_chat_payload(model, messages, enable_thinking, temperature, max_tokens
         "max_tokens": max_tokens,
         "top_p": FIXED_TOP_P,
         "chat_template_kwargs": {"enable_thinking": bool(enable_thinking)},
+        # 13.5 切断をサーバーに伝えるためストリーミングで受け取る（上のコメント参照）。
+        # include_usage を付けると最終チャンクに usage が入り、6.3 の分類・13.6 のクランプ・
+        # tok/s の算出にそのまま使える（実機で取得できることを確認済み）。
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+
+
+def read_sse_completion(conn, response, deadline):
+    """13.5 SSE を読み、非ストリーミング応答と同じ形の dict に集約して返す。
+
+    deadline（`time.monotonic()` 基準の絶対時刻）を超えたら TimeoutError を送出する。
+    ストリーミングではソケットの timeout は「チャンク間隔」にしか効かないため、
+    総経過時間の管理は自前で行い、読み取りごとに残り時間をソケットへ設定する。
+    """
+    content_parts = []
+    reasoning_parts = []
+    finish_reason = None
+    usage = None
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # 呼び出し元の finally で接続を閉じ、切断をサーバーへ伝える
+            raise TimeoutError("timed out")
+        if conn.sock is not None:
+            conn.sock.settimeout(remaining)
+
+        raw_line = response.readline()
+        if not raw_line:
+            break
+
+        line = raw_line.decode("utf-8", "replace").strip()
+        if not line.startswith(SSE_DATA_PREFIX):
+            continue
+        data = line[len(SSE_DATA_PREFIX):].strip()
+        if data == SSE_DONE_MARKER:
+            break
+
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError:
+            # 壊れた行は読み飛ばす（全体を失敗させない）
+            continue
+
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+        for choice in chunk.get("choices") or []:
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+            delta = choice.get("delta") or {}
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+            if delta.get("reasoning_content"):
+                reasoning_parts.append(delta["reasoning_content"])
+
+    # 6.3 の分類・13.6 のクランプ・各種ログ処理を変更せずに使えるよう、
+    # 非ストリーミング応答と同じ構造に組み立てて返す
+    return {
+        "choices": [{
+            "finish_reason": finish_reason,
+            "message": {
+                "content": "".join(content_parts),
+                "reasoning_content": "".join(reasoning_parts),
+            },
+        }],
+        "usage": usage or {},
     }
 
 
 def request_chat_completion(host, port, api_key, payload, timeout_sec, request_id=None):
-    # 例外はそのまま呼び出し元（7.1 のリトライ処理）へ送出する。
-    url = f"{build_lemonade_base_url(host, port)}/chat/completions"
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    """ストリーミングでリクエストし、SSE を集約した応答 dict を返す。
+
+    例外はそのまま呼び出し元（7.1 のリトライ処理）へ送出する。
+    `timeout_sec` は「総経過時間」の上限として扱う（read_sse_completion 参照）。
+    """
+    host = (host or DEFAULT_LEMONADE_HOST).strip()
+    url = f"http://{host}:{port}{CHAT_COMPLETIONS_PATH}"
+    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     # 13.1 タイムアウト時にサーバー側の生成を特定・中断できるよう一意なIDを付与する
@@ -306,23 +389,24 @@ def request_chat_completion(host, port, api_key, payload, timeout_sec, request_i
         headers["X-Request-Id"] = request_id
 
     body = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    deadline = time.monotonic() + timeout_sec
 
-    # 13.5.1 タイムアウト時に確実にTCP接続をクローズし、切断をサーバー側へ伝えること。
-    # 本ノードは urllib（非ストリーミング）を使用しており、以下2経路とも接続が閉じられることを
-    # CPython の urllib/request.py `AbstractHTTPHandler.do_open` のソースで確認済み：
-    #   1) 応答ヘッダ待ちでのタイムアウト（Thinkモードの長いprefillはこちら）
-    #      → h.getresponse() の例外を `except: h.close(); raise` が捕捉しソケットを閉じる
-    #   2) ヘッダ受信後の read() 中のタイムアウト
-    #      → do_open が既に `h.sock.close()` 済み。残る HTTPResponse を下の finally で閉じる
-    # 将来ストリーミング（stream=True 相当）に変更する場合も、この finally の明示クローズは必須。
-    response = None
+    # 13.5.1 ストリーミングでは接続の明示クローズが必須。urllib ではなく http.client を
+    # 直接使うことで、読み取りごとの残り時間設定と finally での確実な close を保証する。
+    conn = http.client.HTTPConnection(host, port, timeout=timeout_sec)
     try:
-        response = urllib.request.urlopen(request, timeout=timeout_sec)
-        return json.loads(response.read().decode("utf-8"))
+        conn.request("POST", CHAT_COMPLETIONS_PATH, body=body, headers=headers)
+        response = conn.getresponse()
+        if response.status >= 400:
+            detail = response.read(MAX_ERROR_BODY_BYTES).decode("utf-8", "replace")
+            # classify_error が http_{code} を返せるよう urllib の例外型に合わせる
+            raise urllib.error.HTTPError(url, response.status, detail, response.headers, None)
+        return read_sse_completion(conn, response, deadline)
     finally:
-        if response is not None:
-            response.close()
+        # 13.5 タイムアウト・例外時に確実にTCP接続を閉じ、切断をサーバーへ伝える。
+        # 生成フェーズの切断がサーバーへ届くのはストリーミングだからで、
+        # 非ストリーミングだと打ち切った生成が最後まで走り続ける（実機確認済み）。
+        conn.close()
 
 
 def extract_response_text(response_payload):
