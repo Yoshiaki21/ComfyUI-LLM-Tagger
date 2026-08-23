@@ -9,7 +9,7 @@ You will be given:
 YOUR JOB:
 Look at the image directly. Using the candidate tags as reference (they may contain errors — trust the image over the tags when they conflict), write one to three plain English sentences describing the image content: pose, expression, clothing, accessories, action, background.
 
-- If a trigger word is provided, refer to the character using the trigger word as a proper noun (e.g. "@charactername stands in..."). If no trigger word is provided, describe the subject generically (e.g. "a girl", "the character").
+- If a trigger word is provided, refer to the character using the trigger word as a proper noun. Use the trigger word string EXACTLY as given to you — do NOT prefix it with "@" or any other symbol, and do not alter it in any way (e.g. if the trigger word is "charactername", write "charactername stands in..."; if the trigger word is "she", write "she stands in..."). If no trigger word is provided, describe the subject generically (e.g. "a girl", "the character").
 - Do NOT mention hair color, hair style, or eye color.
 - Avoid subjective/evaluative words.
 - Do NOT include composition/framing/meta descriptions (e.g. "cowboy shot", "close-up", "from above") as classifications — only describe framing if it reads naturally as part of the scene description.

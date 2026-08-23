@@ -604,3 +604,60 @@
   - `LEMONADE_CANCEL_PATH` は引き続き空（キャンセルAPIは v11.7.0 でも未提供）。実際のキャンセル手段はTCP切断のみ
 
 ---
+
+## タスク17: 自然文への literal `@trigger_word` 混入の修正／13.6分岐の調査（不具合報告2件）
+
+- **完了日**: 2026-08-23
+- **動作確認**: ✅済み（単体10ケース＋実機6ケース＋リトライパス再現＋13.6回帰5シナリオ＋全モード実機回帰）
+- **新規ファイル**: なし
+- **修正ファイル**:
+  - `system_prompts/caption_training_both.txt` / `caption_text_only.txt` : trigger word の指示文を修正
+  - `llm_caption_node.py` : `@trigger_word` 除去の後処理を追加、`RETRY` 行に `applied=` を追加
+  - `LLM_Caption_Node_指示書.md` : 6.1.1新設、10章サンプル更新、13.3に`applied=`追記、12章に1項目追加
+
+### 不具合1: 自然文に literal な `@` + trigger_word が混入する → 修正済み
+
+- **原因**: 旧プロンプトの例示 `e.g. "@charactername stands in..."` を字義通り解釈したモデルが `@she` を出力していた
+- **対処1（プロンプト側）**: `caption_training_both.txt` と `caption_text_only.txt` の該当行を「trigger word の文字列を EXACTLY そのまま使い、`@` などの記号を付けるな」に書き換え、例示も `@` なしに変更（`caption_tags_only.txt` は自然文を生成しないため対象外）
+- **対処2（ノード側の保険）**: `strip_literal_at_trigger_word(text, trigger_word)` を追加
+  - 6.1 の結合で自然文を最終文字列へ組み込む**直前**に適用（タグ列側には影響させない）
+  - 誤爆防止のため `@` の直後が trigger_word で**その後ろに英数字・アンダースコアが続かない場合のみ**置換（`@sheep` / `@she_x` は対象外）
+  - **大文字小文字を無視して照合し、置換時はモデルの表記を保つ**（`@She` → `She`）。文頭で大文字化されるケースに対応するための判断
+  - `caption_only` も自然文を返すため同じ後処理を適用（`tags_only` は対象外）
+  - 置換時は `log.log` に `NOTE: stripped_literal_at_trigger_word image=<name>` を記録
+  - `parse_response()` / `combine_both_output()` の戻り値を `(caption_text, 置換したか)` に変更してログまで伝搬
+- **検証**:
+  - 単体10ケース: `@she`/`@She`/複数箇所/`@suzune` は置換、`@sheep`・`@she_x`・`@about`(tw=`a`) は非置換、trigger_word空は無処理、`trigger_word="@melte"` のときタグ列 `@melte` は保持
+  - **実機**: `trigger_word="she"` で `caption_training_both.txt` / `caption_text_only.txt` × temperature 0.3/0.5/0.7 の**6/6すべてで `@she` の混入なし**
+  - **リトライパス**: 1・2回目を形式崩れで失敗させ temperature が 0.3→0.5→0.7 と上がる状況を再現し、3回目の `@She ... @she` 入り応答が `She ... she` に置換され `NOTE:` が記録されることを確認
+- **副作用（要注意・未対処）**:
+  - プロンプトを「そのまま使え」にした結果、**`trigger_word` に `@` を含めている場合（例 `@melte`）、モデルが自然文から `@` を落とすことがある**（実測6回中4回）
+  - `both` モードはタグ列先頭にプログラムが `@melte` を挿入するため影響は小さいが、**`caption_only` モードでは自然文がキャプション全体になるため、トリガートークンが `melte` になってしまう**
+  - 指示書6.1.1に注意書きとして記載済み
+
+### 不具合2: 13.6の倍増が「2回目の試行」でだけ効かない → **コードの不具合ではなかった**
+
+- **調査結果**: `next_attempt_params()` は `attempt <= 1` の判定の直後に**必ず `previous_reason` で分岐**しており、試行回数による特別扱いは存在しない。2回目だけ13.2が優先される経路は無い
+- **報告されたログを再現**したところ、`8197 → 4098 → 8196` と完全に一致したが、これは**仕様どおりの正しい動作**だった:
+  - 1回目は 8197 を使い **timeout** で失敗 → 13.2 の縮小で2回目 4098（正しい）
+  - 2回目は 4098 を使い **parse_length** で失敗 → 13.6 の倍増で3回目 8196（正しい）
+- **誤読の原因**: `RETRY` 行の `reason=` は「**その試行が失敗した理由**」であって「**そのパラメータを選んだ理由**」ではない。同じ行に並んでいるため、2行目の `max_tokens=4098` と `reason=parse_length` が結び付けて読まれてしまった
+- **対処（ログの改善）**: `RETRY` 行に `applied=` を追加し、パラメータを決めた分岐を明示するようにした
+  ```
+  RETRY: suzune_001.png attempt=1/3 max_tokens=8197 temperature=0.3 applied=initial reason=timeout
+  RETRY: suzune_001.png attempt=2/3 max_tokens=4098 temperature=0.5 applied=13.2_shrink(prev=timeout) reason=parse_length
+  RETRY: suzune_001.png attempt=3/3 max_tokens=8196 temperature=0.5 applied=13.6_grow(prev=parse_length) reason=parse_length
+  ```
+  値は `initial` / `13.2_shrink(prev=...)` / `13.6_grow(prev=...)` / `keep(prev=...)`
+- **13.6.3のチェック項目も再確認**: `parse_length`×3で `8192→16384→31601(クランプ)`、`parse_length→timeout` で3回目が `2048/0.7` に切替、`parse_format`×3で `8192→4096→2048`、`connection`×3で据え置き
+
+### 回帰確認
+
+- 6.3（`finish_reason` 分類）、13.1〜13.5（キャンセル・接続切断・ストリーミング）のロジックは**未変更**
+- 実機で3モード（`both` / `tags_only` / `caption_only`）と `INVALID_PROMPT_FILE` の異常系が従来どおり動作することを確認
+
+### 備考
+
+- 指示書10章のサンプル全文は**旧文面のままだったため、実ファイルに合わせて更新した**（「更新済み」とのご指示だったが差分が入っていなかった）
+
+---

@@ -175,6 +175,22 @@ LLM応答は以下のマーカー形式で返させることを前提にパー�
 - タグ区切りは `, `（カンマ+半角スペース、WD14と同じ）
 - タグ列と自然文の区切りは `. `（ピリオド+半角スペース）
 
+#### 6.1.1 自然文中の literal な `@` + trigger_word の除去【2026-08-23 追加・実装済み】
+
+**症状**：旧システムプロンプトの例示 `e.g. "@charactername stands in..."` を字義通りに解釈したモデルが、自然文パートに literal な `@she` のような文字列を出力する（実運用ログで確認。trigger_word が代名詞のときに顕著）。
+
+**対処は2点セット**：
+
+1. `caption_training_both.txt` / `caption_text_only.txt` の該当指示を「trigger word の文字列をそのまま使い、`@` などの記号を付けないこと」に書き換える（例示も `@` なしに変更）。`caption_tags_only.txt` は自然文を生成しないため対象外
+2. プロンプト修正だけでは再発しうるため、**ノード側にも保険の後処理**を置く
+   - 6.1 の結合で自然文を最終文字列へ組み込む**直前**に、`@` + trigger_word を trigger_word に置換する（タグ列側には影響させない）
+   - 誤爆防止のため、`@` の直後が trigger_word で、**かつその後ろに英数字・アンダースコアが続かない場合のみ**置換する（`@sheep` / `@she_x` は対象外）
+   - 大文字小文字は無視して照合し、置換時は**モデルが出力した表記をそのまま残す**（文頭の `@She` → `She`）
+   - `caption_only` も自然文を返すため同じ後処理を適用する（`tags_only` は対象外）
+   - 置換した場合は `log.log` に `NOTE: stripped_literal_at_trigger_word image=<name>` を記録する
+
+**副作用（要注意）**：プロンプトを「そのまま使え」に変更した結果、**`trigger_word` に `@` を含めている場合（例 `@melte`）、モデルが自然文から `@` を落とすことがある**（実測6回中4回）。`both` モードはタグ列先頭にプログラムが `@melte` を挿入するため影響は小さいが、**`caption_only` モードでは自然文がキャプション全体になるため、トリガートークンが `melte` になってしまう**。`@` 付きトリガーを `caption_only` で使う場合は要注意。
+
 ### 6.2 パース失敗時の扱い
 - `---` マーカーが見つからない、または期待される形式でない場合は**応答不正**とみなし、7章のリトライ処理に従う
 
@@ -354,7 +370,7 @@ PART 1 — CORRECTED TAGS (Danbooru-style):
 
 PART 2 — NATURAL LANGUAGE:
 - One to three plain English sentences describing the SAME content as your corrected PART 1 — must not contradict it (same accessory count, same background characterization, etc).
-- Refer to the character using the trigger word as a proper noun (e.g. "@charactername stands in...").
+- Refer to the character using the trigger word as a proper noun. Use the trigger word string EXACTLY as given to you — do NOT prefix it with "@" or any other symbol, and do not alter it in any way (e.g. if the trigger word is "charactername", write "charactername stands in..."; if the trigger word is "she", write "she stands in...").
 - Do NOT mention hair color, hair style, or eye color.
 - Avoid subjective/evaluative words.
 - Do NOT carry over composition/framing/meta tags (e.g. "cowboy shot", "close-up", "from above") into PART 2's prose — these are shot-type classifications, not natural descriptive language. Omit them from the sentence entirely, or describe framing only if it reads naturally.
@@ -404,7 +420,7 @@ You will be given:
 YOUR JOB:
 Look at the image directly. Using the candidate tags as reference (they may contain errors — trust the image over the tags when they conflict), write one to three plain English sentences describing the image content: pose, expression, clothing, accessories, action, background.
 
-- If a trigger word is provided, refer to the character using the trigger word as a proper noun (e.g. "@charactername stands in..."). If no trigger word is provided, describe the subject generically (e.g. "a girl", "the character").
+- If a trigger word is provided, refer to the character using the trigger word as a proper noun. Use the trigger word string EXACTLY as given to you — do NOT prefix it with "@" or any other symbol, and do not alter it in any way (e.g. if the trigger word is "charactername", write "charactername stands in..."; if the trigger word is "she", write "she stands in..."). If no trigger word is provided, describe the subject generically (e.g. "a girl", "the character").
 - Do NOT mention hair color, hair style, or eye color.
 - Avoid subjective/evaluative words.
 - Do NOT include composition/framing/meta descriptions (e.g. "cowboy shot", "close-up", "from above") as classifications — only describe framing if it reads naturally as part of the scene description.
@@ -439,6 +455,7 @@ Output ONLY the natural language description. No explanation, no extra text, no 
 - [ ] メタデータ行がLLMへの送信前に取り除かれている（system messageにメタデータ行が混入していない）
 - [ ] メタデータ行が無い／不正な値のファイルを選択した場合に、ComfyUI自体は止まらず適切に失敗扱い・ログ記録される（4.1）
 - [ ] トリガーワード空欄時にメッセージからトリガーワード行が省略される
+- [ ] 自然文パートに literal な `@` + trigger_word が残らないこと（6.1.1。trigger_word が代名詞のケース、temperature 0.3/0.5/0.7 のリトライパスを含めて確認）
 - [ ] タグ空文字入力時に即スキップ・ログ記録される
 - [ ] タイムアウト／接続失敗／パース失敗がそれぞれ3回リトライ後にスキップされる
 - [ ] `error.log` と `log.log` がノードディレクトリ直下の `logs/` に正しく追記される（7.3）
@@ -511,6 +528,10 @@ Lemonade Server は Router からバックエンド（llama.cpp 等）への内�
 - `log.log` に、各試行で実際に使用した `max_tokens` / `temperature` を記録する。`reason` には7.1の4分類（`connection` / `timeout` / `parse_length` / `parse_format`）のいずれかを記録する
   - 例（timeoutで縮小）：`[2026-08-23 14:02:11] RETRY: suzune_005.png attempt=2/3 max_tokens=512 temperature=0.5 reason=timeout`
   - 例（parse_lengthで増量、13.6）：`[2026-08-23 14:05:30] RETRY: suzune_008.png attempt=2/3 max_tokens=16384 temperature=0.3 reason=parse_length`
+  - **【2026-08-23 追加】`applied=` フィールドを併記する**。`reason=` は「その試行が**失敗した**理由」であって「そのパラメータを**選んだ**理由」ではないため、両者を取り違えた誤読が実運用で発生した。`applied=` にはパラメータを決めた分岐を出す（`initial` / `13.2_shrink(prev=timeout)` / `13.6_grow(prev=parse_length)` / `keep(prev=connection)`）
+    ```
+    RETRY: suzune_001.png attempt=2/3 max_tokens=4098 temperature=0.5 applied=13.2_shrink(prev=timeout) reason=parse_length detail=...
+    ```
 - キャンセルAPIを呼び出した場合、その成否を記録する（例：`CANCEL_REQUEST_SENT request_id=xxxx` / `CANCEL_FAILED request_id=xxxx reason=...`）
 - `prompt.log`（7.3.1、`log_prompt` ON時）にも、リトライごとの `RESPONSE` 見出しに使用パラメータを付記する
 

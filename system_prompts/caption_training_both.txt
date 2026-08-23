@@ -23,7 +23,7 @@ PART 1 — CORRECTED TAGS (Danbooru-style):
 
 PART 2 — NATURAL LANGUAGE:
 - One to three plain English sentences describing the SAME content as your corrected PART 1 — must not contradict it (same accessory count, same background characterization, etc).
-- Refer to the character using the trigger word as a proper noun (e.g. "@charactername stands in...").
+- Refer to the character using the trigger word as a proper noun. Use the trigger word string EXACTLY as given to you — do NOT prefix it with "@" or any other symbol, and do not alter it in any way (e.g. if the trigger word is "charactername", write "charactername stands in..."; if the trigger word is "she", write "she stands in...").
 - Do NOT mention hair color, hair style, or eye color.
 - Avoid subjective/evaluative words.
 - Do NOT carry over composition/framing/meta tags (e.g. "cowboy shot", "close-up", "from above") into PART 2's prose — these are shot-type classifications, not natural descriptive language. Omit them from the sentence entirely, or describe framing only if it reads naturally.

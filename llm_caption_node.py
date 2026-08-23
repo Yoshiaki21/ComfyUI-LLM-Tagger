@@ -60,6 +60,14 @@ MIN_VALID_RESPONSE_CHARS = 4
 TAG_DELIMITER = ", "
 TAGS_CAPTION_DELIMITER = ". "
 
+# 自然文に literal な "@" + trigger_word が混入したときに取り除くための保険。
+# システムプロンプトの例示（旧: "@charactername stands in..."）を字義通りに解釈した
+# モデルが "@she" のような文字列を出力する事例が実運用ログで確認されたため。
+# プロンプト側の例示は修正済みだが、再発しうるためノード側でも後処理する。
+# "@" の直後が trigger_word で、かつその後ろに英数字・アンダースコアが続かない場合のみ対象。
+# 大文字小文字は無視し、置換時はモデルが出した表記（文頭の大文字など）を保つ。
+LITERAL_AT_TRIGGER_NOTE = "stripped_literal_at_trigger_word"
+
 
 # 7章 エラーハンドリング・リトライ・ログ
 # 7.1 接続失敗／タイムアウト／パース失敗を同一カウンタで最大3回試行する
@@ -473,8 +481,25 @@ def normalize_tag_list(tags_part, trigger_word):
     return tags
 
 
+def strip_literal_at_trigger_word(text, trigger_word):
+    """自然文中の literal な "@" + trigger_word から "@" を取り除く。
+
+    戻り値は (text, 置換したか)。trigger_word が空の場合は何もしない。
+    """
+    trigger_word = (trigger_word or "").strip()
+    if not trigger_word or not text:
+        return text, False
+
+    pattern = re.compile(r"@(" + re.escape(trigger_word) + r")(?![0-9A-Za-z_])", re.IGNORECASE)
+    replaced, count = pattern.subn(r"\1", text)
+    return replaced, count > 0
+
+
 def combine_both_output(tags_part, caption_part, trigger_word):
     # 6.1 学習用結合フォーマット: {trigger_word}, {corrected_tags}. {natural_language_caption}
+    # 戻り値は (結合結果, "@"付きtrigger_wordを除去したか)
+    # 自然文を最終文字列へ組み込む「直前」に後処理する（タグ列側には影響させない）
+    caption_part, stripped = strip_literal_at_trigger_word(caption_part, trigger_word)
     tags = normalize_tag_list(tags_part, trigger_word)
 
     trigger_word = (trigger_word or "").strip()
@@ -485,7 +510,7 @@ def combine_both_output(tags_part, caption_part, trigger_word):
     tag_line = TAG_DELIMITER.join(tags)
     if not tag_line:
         raise CaptionParseError("PART1 から有効なタグを抽出できませんでした")
-    return f"{tag_line}{TAGS_CAPTION_DELIMITER}{caption_part}"
+    return f"{tag_line}{TAGS_CAPTION_DELIMITER}{caption_part}", stripped
 
 
 def classify_parse_failure(response_payload, requested_max_tokens):
@@ -508,6 +533,7 @@ def classify_parse_failure(response_payload, requested_max_tokens):
 def parse_response(raw_response, output_mode, trigger_word, failure_category=REASON_PARSE_FORMAT):
     # 6章 パース本体。失敗時は CaptionParseError を送出する（7.1 のリトライ対象）。
     # failure_category には 6.3 の分類を渡し、送出する例外に付与する。
+    # 戻り値は (caption_text, "@"付きtrigger_wordを除去したか)
     try:
         return _parse_response_body(raw_response, output_mode, trigger_word)
     except CaptionParseError as e:
@@ -524,9 +550,13 @@ def _parse_response_body(raw_response, output_mode, trigger_word):
         tags_part, caption_part = split_both_parts(body)
         return combine_both_output(tags_part, caption_part, trigger_word)
 
-    # tags_only / caption_only は </think> 除去後の応答全体をそのまま使う
+    if output_mode == "caption_only":
+        # caption_only も自然文を返すため both と同じ後処理を行う
+        return strip_literal_at_trigger_word(body, trigger_word)
+
+    # tags_only は </think> 除去後の応答全体をそのまま使う
     # （プロンプト側で "---" 区切りなしの単純テキストを返すよう指示している）
-    return body
+    return body, False
 
 
 def first_value(value, default=None):
@@ -712,6 +742,22 @@ def shrink_retry_params(attempt, base_max_tokens, base_temperature):
     temperature = round(min(RETRY_TEMPERATURE_CEILING,
                             base_temperature + RETRY_TEMPERATURE_DELTA[index]), 2)
     return max_tokens, temperature
+
+
+def describe_params_source(previous_reason, attempt):
+    """13.3 ログ可読性のための補助。
+
+    `RETRY` 行の `reason=` は「その試行が失敗した理由」であって
+    「そのパラメータを選んだ理由」ではない。両者を取り違えた誤読が実運用で発生したため、
+    パラメータがどの分岐で決まったのかを `applied=` として併記する。
+    """
+    if attempt <= 1:
+        return "initial"
+    if previous_reason == REASON_PARSE_LENGTH:
+        return f"13.6_grow(prev={previous_reason})"
+    if previous_reason in SHRINK_REASONS:
+        return f"13.2_shrink(prev={previous_reason})"
+    return f"keep(prev={previous_reason})"
 
 
 def next_attempt_params(previous_reason, attempt, current_max_tokens, current_temperature,
@@ -979,6 +1025,8 @@ class LLMCaptionGenerator:
             # 7.1 直前の試行の失敗理由に応じて次の試行のパラメータを分岐させる
             previous_reason = None
             for attempt in range(1, MAX_ATTEMPTS + 1):
+                # params_source は previous_reason を上書きする前に決める
+                params_source = describe_params_source(previous_reason, attempt)
                 attempt_max_tokens, attempt_temperature, attempt_clamped = next_attempt_params(
                     previous_reason, attempt, attempt_max_tokens, attempt_temperature,
                     max_tokens, temperature, max_context_window, prompt_tokens
@@ -1009,8 +1057,12 @@ class LLMCaptionGenerator:
                     raw_response = extract_response_text(response_payload)
                     # 6.3 パース失敗時にどちらの分類として扱うかを finish_reason から決めておく
                     failure_category = classify_parse_failure(response_payload, attempt_max_tokens)
-                    caption = parse_response(raw_response, output_mode, trigger_word,
-                                             failure_category)
+                    caption, stripped_at_trigger = parse_response(
+                        raw_response, output_mode, trigger_word, failure_category
+                    )
+                    if stripped_at_trigger:
+                        write_log(log_dir,
+                                  f"NOTE: {LITERAL_AT_TRIGGER_NOTE} image={label}")
                     write_log(log_dir, f"SUCCESS: {label} mode={output_mode} attempt={attempt}")
                     success_count += 1
                     break
@@ -1034,7 +1086,7 @@ class LLMCaptionGenerator:
                     write_log(log_dir,
                               f"RETRY: {label} attempt={attempt}/{MAX_ATTEMPTS} "
                               f"max_tokens={attempt_max_tokens} temperature={attempt_temperature} "
-                              f"reason={reason}{clamp_note} detail={e}")
+                              f"applied={params_source} reason={reason}{clamp_note} detail={e}")
                     if attempt == MAX_ATTEMPTS:
                         # 7.4 コンソールはファイル名＋簡易理由のみ。詳細はログファイル参照
                         print(f"[LLMCaptionGenerator] SKIPPED: {label} ({reason})")
