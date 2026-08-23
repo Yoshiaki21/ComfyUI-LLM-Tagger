@@ -4,6 +4,8 @@ import io
 import json
 import os
 import re
+import time
+import uuid
 import urllib.error
 import urllib.request
 
@@ -54,6 +56,28 @@ PROMPT_LOG_INDENT = "    "
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 # 7.3 ログのタイムスタンプ書式
 LOG_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# 13章 Thinkモード暴走対策
+# 13.1 タイムアウト時にサーバー側の生成を明示的に中断させるキャンセルAPIのパス。
+# 【2026-08-23 実サーバー調査結果】Lemonade Server 11.5.0 にはキャンセル用エンドポイントが
+# 存在しない（/openapi.json /docs は404。/api/v1 配下の halt / stop / cancel / abort /
+# interrupt / terminate / kill / requests / generate-stop、および OpenAI Responses API 形式の
+# /responses/{id}/cancel、DELETE /chat/completions/{id} をすべて確認し全て404）。
+# 唯一 POST /api/v1/unload が200を返すが、これはモデル自体をアンロードするため
+# 他の処理・他の利用者にも影響し、キャンセル用途には使えない。
+# → 空文字の間はキャンセル呼び出しをスキップする。将来サーバーが対応したらここにパスを設定するだけでよい
+#    （例: "/api/v1/cancel"）。リクエストのボディは {"request_id": ...} で送る。
+LEMONADE_CANCEL_PATH = ""
+CANCEL_TIMEOUT_SEC = 5
+
+# 13.2 リトライ時のパラメータ調整（インデックスは 試行回数-1）。ウィジェットには公開しない。
+# 2回目は max_tokens 半分・temperature +0.2、3回目は 1/4・+0.4。下限/上限でクリップする。
+RETRY_MAX_TOKENS_SCALE = (1.0, 0.5, 0.25)
+RETRY_MAX_TOKENS_FLOOR = (0, 512, 256)
+RETRY_TEMPERATURE_DELTA = (0.0, 0.2, 0.4)
+RETRY_TEMPERATURE_CEILING = 1.0
+# 13.2 接続失敗はパラメータ調整に意味がないため、この理由のリトライでは元の値のまま再試行する
+NO_PARAM_ADJUST_REASONS = ("connection_failed",)
 
 
 class CaptionParseError(Exception):
@@ -189,12 +213,15 @@ def build_chat_payload(model, messages, enable_thinking, temperature, max_tokens
     }
 
 
-def request_chat_completion(host, port, api_key, payload, timeout_sec):
-    # 7章のリトライ・エラーハンドリングは未実装。ここでは例外はそのまま呼び出し元へ送出する。
+def request_chat_completion(host, port, api_key, payload, timeout_sec, request_id=None):
+    # 例外はそのまま呼び出し元（7.1 のリトライ処理）へ送出する。
     url = f"{build_lemonade_base_url(host, port)}/chat/completions"
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    # 13.1 タイムアウト時にサーバー側の生成を特定・中断できるよう一意なIDを付与する
+    if request_id:
+        headers["X-Request-Id"] = request_id
 
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
@@ -379,6 +406,28 @@ def write_prompt_log(log_dir, header, body=""):
     append_log_line(log_dir, PROMPT_LOG_FILENAME, block)
 
 
+def format_duration(seconds):
+    # 実行全体の所要時間表示用
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.1f}秒"
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}時間{minutes}分{secs}秒"
+    return f"{minutes}分{secs}秒"
+
+
+def format_response_timing(elapsed_sec, response_payload):
+    # RESPONSE の見出し用。usage を返さないサーバーもあるため tok/s は取れるときだけ付ける。
+    parts = [f"{elapsed_sec:.1f}秒"]
+    usage = response_payload.get("usage") or {}
+    completion_tokens = usage.get("completion_tokens")
+    if isinstance(completion_tokens, (int, float)) and elapsed_sec > 0:
+        parts.append(f"{completion_tokens / elapsed_sec:.1f} tok/s")
+    return ", ".join(parts)
+
+
 def describe_image_part(pil_image, image_base64):
     # 画像パートの base64 は1枚で1MBを超えるため、ログには要約だけを残す
     approx_kb = len(image_base64) * 3 // 4 // 1024
@@ -416,6 +465,51 @@ def classify_error(error):
     if isinstance(error, (json.JSONDecodeError, KeyError, IndexError)):
         return "invalid_response"
     return type(error).__name__
+
+
+def adjust_retry_params(attempt, base_max_tokens, base_temperature, adjust=True):
+    # 13.2 暴走の再発防止。同一パラメータで即リトライすると同じ理由で再び暴走しうるため、
+    # 試行回数に応じて max_tokens を絞り temperature を上げる。
+    # adjust=False（接続失敗によるリトライ）のときは元の値のまま再試行する。
+    if not adjust or attempt <= 1:
+        return base_max_tokens, base_temperature
+
+    index = min(attempt - 1, len(RETRY_MAX_TOKENS_SCALE) - 1)
+    scaled = int(base_max_tokens * RETRY_MAX_TOKENS_SCALE[index])
+    # 下限でクリップしたうえで、元の設定値を超えないようにする
+    # （ユーザーが下限より小さい max_tokens を設定している場合に増えてしまうのを防ぐ）
+    max_tokens = min(base_max_tokens, max(RETRY_MAX_TOKENS_FLOOR[index], scaled))
+    # 浮動小数の誤差がログに出ないよう丸める（0.3 + 0.4 = 0.7000000000000001 対策）
+    temperature = round(min(RETRY_TEMPERATURE_CEILING,
+                            base_temperature + RETRY_TEMPERATURE_DELTA[index]), 2)
+    return max_tokens, temperature
+
+
+def cancel_request(log_dir, host, port, api_key, request_id):
+    # 13.1 タイムアウト時にサーバー側の生成を明示的に中断させる。
+    # ベストエフォートであり、失敗しても 7.1 のリトライ処理は継続する（成功は必須条件にしない）。
+    if not LEMONADE_CANCEL_PATH:
+        write_log(log_dir,
+                  f"CANCEL_SKIPPED request_id={request_id} reason=no_endpoint_configured")
+        return False
+
+    host = (host or DEFAULT_LEMONADE_HOST).strip()
+    url = f"http://{host}:{port}{LEMONADE_CANCEL_PATH}"
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    body = json.dumps({"request_id": request_id}).encode("utf-8")
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=CANCEL_TIMEOUT_SEC):
+            pass
+    except (OSError, ValueError) as e:
+        write_log(log_dir, f"CANCEL_FAILED request_id={request_id} reason={e}")
+        return False
+
+    write_log(log_dir, f"CANCEL_REQUEST_SENT request_id={request_id}")
+    return True
 
 
 # 7.1 リトライ対象の例外。
@@ -507,6 +601,7 @@ class LLMCaptionGenerator:
                  lemonade_port, lemonade_api_key, model, enable_thinking, temperature, max_tokens,
                  timeout_sec, always_regenerate=False, log_prompt=False, image_names=""):
         # always_regenerate はキャッシュ制御（IS_CHANGED）専用のため、生成処理では使用しない
+        run_started = time.monotonic()
         # INPUT_IS_LIST = True のため全入力がリストで届く。tags 以外は単一値として取り出す。
         trigger_word = first_value(trigger_word, "")
         output_mode = first_value(output_mode)
@@ -577,7 +672,6 @@ class LLMCaptionGenerator:
             pil_image = resize_if_needed(tensor_to_pil(image_tensor))
             image_base64 = encode_image_base64(pil_image)
             messages = build_messages(system_prompt_text, image_tags, trigger_word, image_base64)
-            payload = build_chat_payload(model, messages, enable_thinking, temperature, max_tokens)
 
             print(f"[LLMCaptionGenerator] {index}/{len(images)} 送信中 "
                   f"(size={pil_image.size[0]}x{pil_image.size[1]})")
@@ -592,15 +686,29 @@ class LLMCaptionGenerator:
 
             # 7.1 接続失敗・タイムアウト・パース失敗を同一カウンタで最大 MAX_ATTEMPTS 回試行
             caption = ""
+            # 13.2 直前の失敗理由に応じて次の試行のパラメータを調整するかどうかを決める
+            adjust_next_attempt = True
             for attempt in range(1, MAX_ATTEMPTS + 1):
+                attempt_max_tokens, attempt_temperature = adjust_retry_params(
+                    attempt, max_tokens, temperature, adjust_next_attempt
+                )
+                payload = build_chat_payload(model, messages, enable_thinking,
+                                             attempt_temperature, attempt_max_tokens)
+                # 13.1 リクエストごとに一意なIDを発行し、タイムアウト時のキャンセルに使う
+                request_id = str(uuid.uuid4())
                 try:
+                    request_started = time.monotonic()
                     response_payload = request_chat_completion(
-                        lemonade_host, lemonade_port, lemonade_api_key, payload, timeout_sec
+                        lemonade_host, lemonade_port, lemonade_api_key, payload, timeout_sec,
+                        request_id=request_id
                     )
+                    elapsed = time.monotonic() - request_started
                     if log_prompt:
+                        timing = format_response_timing(elapsed, response_payload)
                         write_prompt_log(
                             log_dir,
-                            f"RESPONSE {label} (attempt {attempt}/{MAX_ATTEMPTS}):",
+                            f"RESPONSE {label} (attempt {attempt}/{MAX_ATTEMPTS}, {timing}, "
+                            f"max_tokens={attempt_max_tokens}, temp={attempt_temperature}):",
                             format_response_for_log(response_payload),
                         )
                     raw_response = extract_response_text(response_payload)
@@ -610,8 +718,17 @@ class LLMCaptionGenerator:
                     break
                 except RETRYABLE_EXCEPTIONS as e:
                     reason = classify_error(e)
+                    # 13.1 タイムアウト時はサーバー側の生成を明示的に中断させる（ベストエフォート）
+                    if reason == "timeout":
+                        cancel_request(log_dir, lemonade_host, lemonade_port,
+                                       lemonade_api_key, request_id)
+                    # 13.2 接続失敗ではパラメータ調整に意味がないため元の値のまま再試行する
+                    adjust_next_attempt = reason not in NO_PARAM_ADJUST_REASONS
+                    # 13.3 各試行で実際に使用したパラメータを記録する
                     write_log(log_dir,
-                              f"RETRY {attempt}/{MAX_ATTEMPTS}: {label} reason={reason} detail={e}")
+                              f"RETRY: {label} attempt={attempt}/{MAX_ATTEMPTS} "
+                              f"max_tokens={attempt_max_tokens} temperature={attempt_temperature} "
+                              f"reason={reason} detail={e}")
                     if attempt == MAX_ATTEMPTS:
                         # 7.4 コンソールはファイル名＋簡易理由のみ。詳細はログファイル参照
                         print(f"[LLMCaptionGenerator] SKIPPED: {label} ({reason})")
@@ -628,6 +745,7 @@ class LLMCaptionGenerator:
         print(f"[LLMCaptionGenerator] 完了: 成功 {success_count}件 / スキップ {skipped_count}件"
               + (f"（詳細は {os.path.join(log_dir, ERROR_LOG_FILENAME)} を参照）"
                  if skipped_count else ""))
-        write_log(log_dir, f"RUN END: success={success_count} skipped={skipped_count}")
+        write_log(log_dir, f"RUN END: success={success_count} skipped={skipped_count} "
+                           f"elapsed={format_duration(time.monotonic() - run_started)}")
 
         return (results,)

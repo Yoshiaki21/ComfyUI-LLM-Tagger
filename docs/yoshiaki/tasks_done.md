@@ -340,3 +340,83 @@
   - 100枚バッチで約460KB/回の増加見込み（base64を除外しているため）。追記型なのでローテーションは未実装、肥大化したら手動削除
   - `prompt.log` も `logs/` 配下のため `.gitignore` 済み
 ---
+
+## タスク11: 処理時間・トークン生成速度のログ記録
+
+- **完了日**: 2026-08-23
+- **動作確認**: ✅済み（整形ヘルパーの単体テスト＋実機Lemonade Serverでの記録内容を確認。リトライが実際に発生したケースも観測）
+- **新規ファイル**: なし
+- **修正ファイル**:
+  - `llm_caption_node.py` : 所要時間・トークン生成速度の計測と記録を追加
+  - `LLM_Caption_Node_指示書.md` : 7.3.1の `RESPONSE` 記録内容と計測方針、7.3の `log.log` 説明を更新
+- **決定事項（ユーザー判断）**:
+  1. LLM1回あたりの所要時間に加え、**トークン生成速度も記録する**
+  2. 失敗（タイムアウト・接続失敗）時の経過時間は**記録しない**
+  3. 実行全体の所要時間は **`log_prompt` の ON/OFF に関わらず常時記録**する
+- **変更内容**:
+  - `import time` を追加
+  - `format_duration(seconds)` を追加。`3.1秒` / `12分34秒` / `1時間2分3秒` の形に整形（負値は0秒扱い）
+  - `format_response_timing(elapsed_sec, response_payload)` を追加。`50.4秒, 23.5 tok/s` の形。**`usage` を返さないサーバー向けに tok/s は取得できたときだけ付ける**（`usage` なし／空dict／`elapsed=0` では秒数のみ）
+  - `generate()` の冒頭で `run_started = time.monotonic()` を記録
+  - リトライループ内で `request_chat_completion()` の前後を計測し、`prompt.log` の `RESPONSE` 見出しに反映
+  - `log.log` の `RUN END` 行に `elapsed=...` を追加（常時）
+- **検証結果**:
+  - `format_duration`: `0.0秒` / `3.1秒` / `59.9秒` / `1分0秒` / `12分34秒` / `1時間2分3秒`、負値も `0.0秒`
+  - `format_response_timing`: usage あり → `50.4秒, 23.5 tok/s`、usage なし・空dict・`elapsed=0` → 秒数のみ
+  - 実機の `prompt.log`:
+    ```
+    RESPONSE melte0001.png (attempt 1/3, 196.2秒, 41.8 tok/s):
+    RESPONSE melte0001.png (attempt 2/3, 25.8秒, 52.5 tok/s):
+    RESPONSE melte0001.png (attempt 1/3, 68.8秒, 49.0 tok/s):
+    ```
+  - 実機の `log.log`: `RUN END: success=1 skipped=0 elapsed=3分42秒` / `elapsed=1分8秒`
+- **備考（実機で観測した重要な事象）**:
+  - 検証中に**1回目の試行で thinking が暴走**し、`max_tokens=8192` を使い切って本文が生成されないケースが実際に発生した（`thinking で 26729 文字を消費`）。**7章のリトライが働いて2回目で成功**し、`SUCCESS: melte0001.png mode=both attempt=2` として記録された
+  - つまり `max_tokens=8192` でも thinking 暴走は起こりうる。リトライ機構が実運用で機能していることの実証にもなった
+  - 同じ入力でも所要時間は 25.8秒〜196.2秒（thinking量に依存）と大きく変動する。tok/s は 41.8〜52.5 と比較的安定しており、モデル・設定の比較にはこちらが有用
+
+---
+
+## タスク12: 指示書13章「Thinkモード暴走対策」実装
+
+- **完了日**: 2026-08-23
+- **動作確認**: ✅済み（パラメータ調整の単体テスト6パターン＋実機タイムアウト／パース失敗／接続失敗の3シナリオでログを確認）
+- **新規ファイル**: なし
+- **修正ファイル**:
+  - `llm_caption_node.py` : `X-Request-Id` 付与、キャンセル呼び出し、リトライ時パラメータ調整、ログ反映
+  - `LLM_Caption_Node_指示書.md` : 13.1にキャンセルAPI調査結果を追記、13.4の保留事項を更新
+- **13.1 キャンセルAPIの調査結果（重要）**:
+  - **Lemonade Server 11.5.0 にはキャンセル用エンドポイントが存在しないことを実機で確認した**
+  - 404だったもの: `/openapi.json` `/docs` `/api/openapi.json` `/api/v1/docs` `/v1/docs`（APIリファレンス自体が非公開）、`/api/v1/` 配下の `halt` `stop` `cancel` `abort` `interrupt` `terminate` `kill` `requests` `generate/stop` `chat/completions/cancel` `completions/cancel`、OpenAI Responses API 形式の `POST /api/v1/responses/{id}/cancel` `POST /v1/responses/{id}/cancel` `DELETE /api/v1/responses/{id}` `DELETE /api/v1/chat/completions/{id}`
+  - 唯一 `POST /api/v1/unload` が200を返すが、**モデル自体をアンロードする**ため他の処理・他の利用者に影響する。単一リクエストのキャンセル用途には使えないため**採用しなかった**
+  - **対応方針**: 仕組みは実装済みとし、パスを定数 `LEMONADE_CANCEL_PATH`（既定 `""`）で切り替え可能にした。空文字の間はキャンセルをスキップして `CANCEL_SKIPPED ... reason=no_endpoint_configured` を記録する。将来サーバーが対応したら**定数にパスを設定するだけで有効になる**
+- **変更内容（13.1）**:
+  - `import uuid` を追加。リクエストごとに `uuid.uuid4()` で一意なIDを発行し `X-Request-Id` ヘッダーとして送信（`request_chat_completion()` に `request_id` 引数を追加）
+  - `cancel_request()` を追加。タイムアウト検知時のみ呼ばれ、`{"request_id": ...}` を POST する。**ベストエフォート**で、失敗しても例外を外に出さずリトライ処理を継続する（`CANCEL_FAILED` を記録）
+  - `CANCEL_TIMEOUT_SEC = 5`
+- **変更内容（13.2）**:
+  - `adjust_retry_params(attempt, base_max_tokens, base_temperature, adjust=True)` を追加
+  - 定数はファイル冒頭にまとめた: `RETRY_MAX_TOKENS_SCALE = (1.0, 0.5, 0.25)` / `RETRY_MAX_TOKENS_FLOOR = (0, 512, 256)` / `RETRY_TEMPERATURE_DELTA = (0.0, 0.2, 0.4)` / `RETRY_TEMPERATURE_CEILING = 1.0` / `NO_PARAM_ADJUST_REASONS = ("connection_failed",)`。**ウィジェットには公開していない**
+  - 下限でクリップした後に**元の設定値を超えないようにクリップ**している（ユーザーが `max_tokens=300` のように下限より小さい値を設定した場合に、リトライで逆に増えてしまうのを防ぐため）
+  - `temperature` は浮動小数の誤差を避けるため `round(..., 2)`（`0.3 + 0.4 = 0.7000000000000001` 対策）
+  - 添字は `min(attempt - 1, len(...) - 1)` でクリップし、`MAX_ATTEMPTS` を増やしても添字が溢れないようにした
+  - `payload` の構築をリトライループの**内側**へ移動（試行ごとにパラメータが変わるため）
+- **変更内容（13.3）**:
+  - `RETRY` 行の書式を13.3の例に合わせて変更: `RETRY: melte0001.png attempt=2/3 max_tokens=4096 temperature=0.5 reason=timeout detail=...`
+  - `CANCEL_REQUEST_SENT` / `CANCEL_FAILED` / `CANCEL_SKIPPED` を `log.log` に記録
+  - `prompt.log` の `RESPONSE` 見出しに使用パラメータを付記: `(attempt 2/3, 25.8秒, 52.5 tok/s, max_tokens=4096, temp=0.5)`
+- **検証結果**:
+  - パラメータ調整（`max_tokens=8192, temp=0.3`）: 1回目 `8192/0.3` → 2回目 `4096/0.5` → 3回目 `2048/0.7`
+  - 下限クリップ（`max_tokens=600`）: `600` → `512` → `256`
+  - 元の値を超えない（`max_tokens=300`）: `300` → `300` → `256`
+  - `temperature` 上限クリップ（base=0.9）: `0.9` → `1.0` → `1.0`
+  - 接続失敗（`adjust=False`）: 3回とも `8192/0.3` のまま
+  - `attempt=5` でも添字が溢れず `(2048, 0.7)`
+  - 実機タイムアウト: `CANCEL_SKIPPED request_id=19a3ee54-... reason=no_endpoint_configured` → `RETRY: ... attempt=1/3 max_tokens=8192 temperature=0.3 reason=timeout` → 2回目 `4096/0.5` → 3回目 `2048/0.7` → `SKIPPED`
+  - パース失敗: 同様にパラメータが段階的に変化し、`request_id` が試行ごとに異なることを確認
+  - 接続失敗: 3回とも `max_tokens=8192 temperature=0.3` で据え置き（13.2の規定どおり）
+- **備考**:
+  - キャンセルできない以上、**タイムアウト後もサーバー側の生成はしばらく走り続ける可能性がある**。13.2 のパラメータ調整が実質的な暴走対策の主軸となる（指示書13.4にも追記）
+  - Lemonade Server内部の約5分タイムアウトは引き続きクライアント側からは変更できない
+
+---
