@@ -20,6 +20,14 @@ FALLBACK_MODEL_LABEL = "(Lemonade Server unavailable - check host/port)"
 SYSTEM_PROMPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_prompts")
 FALLBACK_SYSTEM_PROMPT_LABEL = "(no .txt files found in system_prompts/)"
 
+# 4.1 output_mode はウィジェットではなく、プロンプトファイル1行目のメタデータ行から判定する
+#     例: <!-- output_mode: both -->
+OUTPUT_MODE_HEADER_PATTERN = re.compile(r"^\s*<!--\s*output_mode\s*:\s*([A-Za-z_]+)\s*-->\s*$")
+VALID_OUTPUT_MODES = ("tags_only", "caption_only", "both")
+# 4.1 メタデータ行が無い／値が不正なファイルを選択したときのログ・スキップ理由
+INVALID_PROMPT_FILE_REASON = "missing_or_invalid_output_mode_header"
+REASON_INVALID_PROMPT_FILE = "invalid_prompt_file"
+
 # 5.1 画像前処理：長辺がこの値を超える場合のみリサイズする（以下ならそのまま送信）
 MAX_IMAGE_LONG_EDGE = 1024
 IMAGE_FORMAT = "PNG"
@@ -173,6 +181,32 @@ def read_system_prompt_file(filename):
     path = os.path.join(SYSTEM_PROMPTS_DIR, filename)
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
+
+
+def parse_system_prompt_file(filename):
+    """4.1 1行目のメタデータ行から output_mode を判定し、その行を除いた本文を返す。
+
+    戻り値は (output_mode, system_message)。メタデータ行が無い・値が3種類以外・
+    ファイルが読めない場合は output_mode を None にして返す（呼び出し側で失敗扱いにする）。
+    ComfyUI 自体を止めないため、ここでは例外を送出しない。
+    """
+    try:
+        text = read_system_prompt_file(filename)
+    except OSError as e:
+        print(f"[LLMCaptionGenerator] system prompt の読み込みに失敗しました ({filename}): {e}")
+        return None, ""
+
+    lines = text.splitlines()
+    match = OUTPUT_MODE_HEADER_PATTERN.match(lines[0]) if lines else None
+    if not match:
+        return None, text
+
+    output_mode = match.group(1).strip()
+    if output_mode not in VALID_OUTPUT_MODES:
+        return None, text
+
+    # メタデータ行はLLMに見せない。除去後に先頭へ残る空行も落とす
+    return output_mode, "\n".join(lines[1:]).lstrip("\n")
 
 
 def iter_images(image):
@@ -672,7 +706,8 @@ class LLMCaptionGenerator:
                 "image": ("IMAGE",),
                 "tags": ("STRING", {"multiline": True, "default": ""}),
                 "trigger_word": ("STRING", {"default": ""}),
-                "output_mode": (["tags_only", "caption_only", "both"],),
+                # 4.1 output_mode ウィジェットは廃止。system_prompt_file 1行目の
+                # メタデータ行（<!-- output_mode: ... -->）から自動判定する
                 "system_prompt_file": (system_prompt_files,),
                 "lemonade_host": ("STRING", {"default": DEFAULT_LEMONADE_HOST}),
                 "lemonade_port": ("INT", {"default": DEFAULT_LEMONADE_PORT, "min": 1, "max": 65535}),
@@ -727,7 +762,7 @@ class LLMCaptionGenerator:
     #    IsChangedCache が generate() と同じ _async_map_node_over_list 経由で呼ぶため）。
     #    なお他ノードから接続された入力は IS_CHANGED 呼び出し時点では確定しておらず (None,) で届く。
     @classmethod
-    def IS_CHANGED(cls, image, tags, trigger_word, output_mode, system_prompt_file, lemonade_host,
+    def IS_CHANGED(cls, image, tags, trigger_word, system_prompt_file, lemonade_host,
                    lemonade_port, lemonade_api_key, model, enable_thinking, temperature, max_tokens,
                    timeout_sec, always_regenerate, log_prompt, image_names=""):
         if first_value(always_regenerate, False):
@@ -738,14 +773,13 @@ class LLMCaptionGenerator:
         # （comfy_execution/caching.py の get_immediate_node_signature）、入力が変われば再実行される。
         return False
 
-    def generate(self, image, tags, trigger_word, output_mode, system_prompt_file, lemonade_host,
+    def generate(self, image, tags, trigger_word, system_prompt_file, lemonade_host,
                  lemonade_port, lemonade_api_key, model, enable_thinking, temperature, max_tokens,
                  timeout_sec, always_regenerate=False, log_prompt=False, image_names=""):
         # always_regenerate はキャッシュ制御（IS_CHANGED）専用のため、生成処理では使用しない
         run_started = time.monotonic()
         # INPUT_IS_LIST = True のため全入力がリストで届く。tags 以外は単一値として取り出す。
         trigger_word = first_value(trigger_word, "")
-        output_mode = first_value(output_mode)
         system_prompt_file = first_value(system_prompt_file)
         lemonade_host = first_value(lemonade_host, DEFAULT_LEMONADE_HOST)
         lemonade_port = first_value(lemonade_port, DEFAULT_LEMONADE_PORT)
@@ -758,10 +792,12 @@ class LLMCaptionGenerator:
         log_prompt = first_value(log_prompt, False)
         image_names = first_value(image_names, "")
 
+        # 4.1 メタデータ行から output_mode を判定し、その行を除いた本文を system message にする
         if system_prompt_file == FALLBACK_SYSTEM_PROMPT_LABEL:
-            system_prompt_text = ""
+            output_mode, system_prompt_text = None, ""
         else:
-            system_prompt_text = read_system_prompt_file(system_prompt_file)
+            output_mode, system_prompt_text = parse_system_prompt_file(system_prompt_file)
+        prompt_file_is_invalid = output_mode is None
 
         # image はバッチテンソル1個のリスト、または上流によってはテンソルのリストで届く
         images = list(iter_images(image))
@@ -772,7 +808,7 @@ class LLMCaptionGenerator:
 
         # 7.4.1 デバッグ用の設定値サマリ。バッチ内で値は不変のため実行開始時に1回だけ出力する
         # （7.4 のコンソール出力簡略化を行う際もこの行は残すこと）
-        summary = (f"開始: {len(images)}枚, model={model}, mode={output_mode}, "
+        summary = (f"開始: {len(images)}枚, model={model}, mode={output_mode or 'INVALID'}, "
                    f"prompt={system_prompt_file}, thinking={enable_thinking}, temp={temperature}, "
                    f"top_p={FIXED_TOP_P}, max_tokens={max_tokens}, timeout={timeout_sec}s")
         print(f"[LLMCaptionGenerator] {summary}")
@@ -787,6 +823,15 @@ class LLMCaptionGenerator:
                 f"PROMPT system ({system_prompt_file}, {len(system_prompt_text)}文字):",
                 system_prompt_text,
             )
+
+        # 4.1 メタデータ行が無い／不正な場合は、この実行のすべての画像を失敗扱いにする
+        if prompt_file_is_invalid:
+            print(f"[LLMCaptionGenerator] INVALID_PROMPT_FILE: {system_prompt_file} "
+                  f"({INVALID_PROMPT_FILE_REASON})")
+            write_log(log_dir,
+                      f"INVALID_PROMPT_FILE: {system_prompt_file} "
+                      f"reason={INVALID_PROMPT_FILE_REASON}",
+                      is_error=True)
 
         # 9章 タグと画像の件数が食い違うと対応がずれるため警告する（処理自体は継続）
         tag_count = len(tags) if isinstance(tags, list) else 1
@@ -806,6 +851,15 @@ class LLMCaptionGenerator:
             label = labels[index - 1]
             image_tags = tags_per_image[index - 1]
             write_log(log_dir, f"START: {label}")
+
+            # 4.1 事前チェック：プロンプトファイルが不正ならLLMを呼ばずに即スキップ
+            if prompt_file_is_invalid:
+                print(f"[LLMCaptionGenerator] SKIPPED: {label} ({REASON_INVALID_PROMPT_FILE})")
+                write_log(log_dir,
+                          f"SKIPPED: {label} reason={REASON_INVALID_PROMPT_FILE}", is_error=True)
+                # 9章：スキップしても枚数・順序を崩さないよう空文字を入れる
+                results.append("")
+                continue
 
             # 7.2 事前チェック：tags が空文字ならLLMを呼ばずに即スキップ（リトライ対象外）
             if not image_tags.strip():

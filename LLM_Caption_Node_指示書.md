@@ -35,8 +35,7 @@ LoRA Caption Load ──┬── image list ───────────�
 | `image` | `IMAGE` | 必須 | LoRA Caption Load の image list から接続。バッチ（リスト）対応 |
 | `tags` | `STRING` | 必須 | WD14 Tagger の文字列出力から接続。空文字の場合は該当画像を失敗扱い |
 | `trigger_word` | `STRING`（ウィジェット直接入力） | 任意 | 空欄可。学習用途では入力、単純タグ/自然文抽出では省略可 |
-| `output_mode` | `STRING`（コンボボックス） | 必須 | `tags_only` / `caption_only` / `both` の3択 |
-| `system_prompt_file` | `STRING`（コンボボックス、動的） | 必須 | 指定フォルダ内の `.txt` 一覧から選択（詳細は4章） |
+| `system_prompt_file` | `STRING`（コンボボックス、動的） | 必須 | 指定フォルダ内の `.txt` 一覧から選択。ファイル冒頭のメタデータ行から`output_mode`を自動判定する（ウィジェットとしての`output_mode`は廃止。詳細は4章） |
 | `lemonade_host` | `STRING`（ウィジェット） | 必須 | 例：`127.0.0.1` |
 | `lemonade_port` | `INT`（ウィジェット） | 必須 | 例：`8000` |
 | `lemonade_api_key` | `STRING`（ウィジェット） | 任意 | 将来の認証用。空欄可 |
@@ -53,7 +52,7 @@ LoRA Caption Load ──┬── image list ───────────�
 
 | 名前 | 型 | 説明 |
 |---|---|---|
-| `caption_text` | `STRING`（リスト） | `output_mode` に応じた最終文字列（1画像1要素、image listと同じ順序・同じ枚数） |
+| `caption_text` | `STRING`（リスト） | 選択された`system_prompt_file`のメタデータ行が示す`output_mode`に応じた最終文字列（1画像1要素、image listと同じ順序・同じ枚数） |
 
 ※ `LoRA Caption Save` の `text` 入力へそのまま接続できるよう、リストの長さ・順序を `image` 入力と厳密に一致させること。
 
@@ -71,12 +70,48 @@ LoRA Caption Load ──┬── image list ───────────�
 ## 4. システムプロンプトファイル管理
 
 - 指定フォルダ（例：`ComfyUI/custom_nodes/<node_dir>/system_prompts/`）内の `.txt` ファイル一覧をコンボボックスに表示
-- 選択されたファイルの中身をそのまま LLM への system message として使用
 - モデル一覧と同様、**F5リロードで一覧を再取得**する仕様にする
 - 用途別に以下3種類のプロンプトファイルを同梱すること（本指示書末尾のサンプルを初期データとして使用）：
   1. `caption_training_both.txt`（学習用・タグ+自然文両方、トリガーワード必須想定）
   2. `caption_tags_only.txt`（タグ抽出＋整合性チェック用）
   3. `caption_text_only.txt`（自然文のみ、トリガーワード条件付き）
+
+### 4.1 `output_mode` の自動判定（メタデータ行方式）【2026-08-23 追加】
+
+`output_mode`ウィジェットは廃止し、`system_prompt_file`の内容から自動判定する。ファイル冒頭に以下の形式でメタデータ行を1行だけ置く。
+
+```
+<!-- output_mode: both -->
+（以降がLLMに送るsystem messageの本文）
+```
+
+- 値は `tags_only` / `caption_only` / `both` の3種類のみを許可する
+- **ノードはファイル読み込み時にこの1行を解析し、`output_mode`として内部変数に保持したうえで、この行自体を取り除いてから system message として LLM に送信する**（LLMにメタデータ行を見せない）
+- メタデータ行が無い、または値が3種類以外の場合：ComfyUI起動自体を止めず、該当ファイルをコンボボックスの選択肢から除外するか、選択された場合はそのファイルを**即座に失敗扱い**にしてログに `INVALID_PROMPT_FILE: <filename> reason=missing_or_invalid_output_mode_header` を記録する（実装しやすい方を採用してよい）
+- 同梱する3種類のサンプルファイル（10章）には、それぞれ対応する`output_mode`のメタデータ行を付与済みとする
+
+#### 4.1.1 実装結果【2026-08-23 実装・検証済み】
+
+- `parse_system_prompt_file(filename)` を追加。戻り値は `(output_mode, system_message)` で、**メタデータ行を取り除いた本文だけ**を system message として返す（除去後に先頭へ残る空行も落とす）
+- 判定は正規表現 `^\s*<!--\s*output_mode\s*:\s*([A-Za-z_]+)\s*-->\s*$` を**1行目のみ**に適用する。前後の空白や `<!--` 内の空白の揺れは許容するが、2行目以降に書かれていても認識しない
+- **異常系は 4.1 の選択肢②（実行時に失敗扱い）を採用**した。コンボボックスからは除外せず、選択して実行した時点で失敗させる（除外方式だとファイルが黙って消え、原因が分からなくなるため）
+  - `output_mode` が `None`（メタデータ行なし／値が3種類以外／ファイルが読めない）のとき、`INVALID_PROMPT_FILE: <filename> reason=missing_or_invalid_output_mode_header` を `log.log` と `error.log` に記録し、**その実行の全画像を LLM 呼び出し前にスキップ**する（7.2 の `empty_tags` と同じ扱い）
+  - 各画像には `SKIPPED: <label> reason=invalid_prompt_file` を記録し、`caption_text` には空文字を入れて枚数・順序を維持する（9章）
+  - ファイル読み込み時の `OSError` も握りつぶして `None` を返すため、**ComfyUI 自体は止まらない**
+- 7.4.1 の設定値サマリ行では `mode=` に判定結果を出力する（不正時は `mode=INVALID`）
+- **検証結果**：
+  | 入力 | 判定 |
+  |---|---|
+  | `<!-- output_mode: both -->` ほか同梱3ファイル | `both` / `tags_only` / `caption_only`。本文に `output_mode` 行が残っていないことを確認 |
+  | メタデータ行なし | `None`（失敗扱い） |
+  | `<!-- output_mode: whatever -->` | `None`（失敗扱い） |
+  | 空ファイル | `None`（失敗扱い） |
+  | 2行目にメタデータ行 | `None`（1行目のみ判定するため） |
+  | `   <!--   output_mode :  both   -->   ` | `both`（空白の揺れは許容） |
+  | 存在しないファイル | `None`（例外を出さず失敗扱い） |
+  - 実機で3モードすべてを実行し、`mode=both` / `mode=tags_only` / `mode=caption_only` が自動判定されて正しい形式の文字列が出力されることを確認
+  - `prompt.log` に `output_mode` の文字列が **0件**であること（メタデータ行がLLMに送られていないこと）を確認
+  - メタデータ行なしのファイルを2枚バッチで選択 → `INVALID_PROMPT_FILE` を記録して2枚ともスキップ、出力は空文字2件で枚数維持
 
 ---
 
@@ -125,7 +160,7 @@ LLM応答は以下のマーカー形式で返させることを前提にパー�
 
 - `---` で分割し、前半をタグ部分、後半を自然文部分として抽出
 - 前後の空白・改行はトリムする
-- **`output_mode = tags_only`**：タグ部分のみ返す（システムプロンプトが「タグのみ整合性チェック」用の場合、`---`区切りなしの単純な応答形式にしてもよい。パース処理はプロンプトファイルの想定形式に合わせて2パターン用意：区切りあり／区切りなし単純テキスト）
+- **`output_mode = tags_only`**（4.1のメタデータ行で判定）：タグ部分のみ返す（システムプロンプトが「タグのみ整合性チェック」用の場合、`---`区切りなしの単純な応答形式にしてもよい。パース処理はプロンプトファイルの想定形式に合わせて2パターン用意：区切りあり／区切りなし単純テキスト）
 - **`output_mode = caption_only`**：自然文部分のみ返す
 - **`output_mode = both`**：下記6.1の結合フォーマットで返す
 
@@ -291,9 +326,10 @@ LLM応答は以下のマーカー形式で返させることを前提にパー�
 
 ### 10.1 `caption_training_both.txt`（学習用・タグ+自然文両方）
 
-以下の内容をそのまま使用する（検証済み）：
+以下の内容をそのまま使用する（検証済み）。1行目のメタデータ行（4.1参照）を含めること：
 
 ```
+<!-- output_mode: both -->
 You are a captioning assistant generating training captions for a LoRA (character LoRA on the Anima diffusion model).
 
 You will be given:
@@ -328,7 +364,10 @@ Be conservative: when the candidate tags and the image seem to genuinely agree, 
 
 ### 10.2 `caption_tags_only.txt`（タグ抽出・整合性チェック用）
 
+1行目のメタデータ行（4.1参照）を含めること：
+
 ```
+<!-- output_mode: tags_only -->
 You are a tag verification assistant.
 
 You will be given:
@@ -351,7 +390,10 @@ Output ONLY the corrected tag list, comma-separated, lowercase, spaces instead o
 
 ### 10.3 `caption_text_only.txt`（自然文のみ）
 
+1行目のメタデータ行（4.1参照）を含めること：
+
 ```
+<!-- output_mode: caption_only -->
 You are a captioning assistant generating natural language descriptions of an image.
 
 You will be given:
@@ -393,7 +435,9 @@ Output ONLY the natural language description. No explanation, no extra text, no 
 ## 12. 動作確認チェックリスト（実装後）
 
 - [ ] `image` リストの枚数・順序と `caption_text` 出力の枚数・順序が一致する
-- [ ] `output_mode` の3パターンそれぞれで正しい文字列が出力される
+- [ ] `system_prompt_file`冒頭のメタデータ行から`output_mode`が正しく自動判定され、3パターンそれぞれで正しい文字列が出力される（4.1）
+- [ ] メタデータ行がLLMへの送信前に取り除かれている（system messageにメタデータ行が混入していない）
+- [ ] メタデータ行が無い／不正な値のファイルを選択した場合に、ComfyUI自体は止まらず適切に失敗扱い・ログ記録される（4.1）
 - [ ] トリガーワード空欄時にメッセージからトリガーワード行が省略される
 - [ ] タグ空文字入力時に即スキップ・ログ記録される
 - [ ] タイムアウト／接続失敗／パース失敗がそれぞれ3回リトライ後にスキップされる
@@ -556,24 +600,3 @@ Lemonade Server は v11.5.0 → v11.7.0 で以下の関連修正が入った：
 - [ ] `max_context_window`を超える増量が発生した場合にクランプされ、ログに`note=clamped_by_max_context_window`が記録されること
 - [ ] `parse_length`増量後の試行が`timeout`になった場合、その回のみ13.2の縮小方向の調整に切り替わること（固定表ではなく直前の失敗理由で分岐していること）
 - [ ] `max_tokens`ウィジェットを未接続時のデフォルト値`8192`から自動増量が開始されること
-
-### 13.6.4 実装結果【2026-08-23 実装・検証済み】
-
-- **6.3の分類**：`CaptionParseError` に `category` を持たせ、`classify_parse_failure()` が `finish_reason` から `parse_length` / `parse_format` を決定する。`usage.completion_tokens >= 要求 max_tokens` の場合は `finish_reason == "stop"` でも `parse_length` とみなす（補強材料）。`usage` 未対応サーバーでは `finish_reason` のみで判定する
-- **分岐ロジック**：固定テーブル `adjust_retry_params()` を廃止し、直前の失敗理由で分岐する `next_attempt_params()` に置き換えた
-  - `parse_length` → 直前に使用した値の2倍（`clamp_max_tokens()` でクランプ）。`temperature` は据え置き
-  - `timeout` / `parse_format` → `shrink_retry_params()`（13.2の表を試行回数で索く。基準はウィジェット設定値）
-  - `connection`、およびHTTPエラー・不正JSONなど4分類外 → 調整なし（直前に使用した値のまま再試行）
-- **上限クランプ**：3章の `/v1/models` 取得時に `max_context_window` を `MODEL_CONTEXT_WINDOWS` にキャッシュし、`get_model_context_window()` で解決する（未取得なら1回だけ再取得、失敗時は `None` を返しクランプしない）。プロンプト側トークン数は **応答の `usage.prompt_tokens` が取れればそれを優先**し、無ければ「テキスト文字数÷4 ＋ 画像分1024トークン」の概算を使う。`CONTEXT_SAFETY_MARGIN_TOKENS = 256` の余裕を引く
-- **実測値**：`gemma-4-26B-A4B-it-QAT-GGUF` の `max_context_window` は **262144**（サーバーから取得）
-- **検証結果**：
-  | シナリオ | 各試行の `max_tokens` / `temperature` |
-  |---|---|
-  | `parse_length` ×3（window=32768, prompt=911） | `8192/0.3` → `16384/0.3` → **`31601/0.3`（クランプ）** |
-  | `parse_length` → `timeout` → 3回目 | `8192/0.3` → `16384/0.3` → **`2048/0.7`（13.2の縮小へ切替）** |
-  | `parse_format` ×3 | `8192/0.3` → `4096/0.5` → `2048/0.7` |
-  | `connection` ×3 | `8192/0.3` ×3（据え置き） |
-  | 1回目で成功 | `8192/0.3` のみ（リトライなし） |
-  - クランプ発生時のログ：`RETRY: a.png attempt=3/3 max_tokens=31601 temperature=0.3 reason=parse_length note=clamped_by_max_context_window detail=...`
-  - **実機検証**：`max_tokens=8` を指定して実際に `finish_reason == "length"` を発生させ、`8 → 16 → 32` と倍増することを確認（`reason=parse_length`）
-- **13.2の表の索き方について**：13.2の補足にある「1回目`parse_length`→2回目`timeout`の場合、本表の『2回目』の行を適用」という記述は、表が試行回数で索かれる設計と整合しない（2回目の試行が失敗したとき調整対象になるのは3回目の試行のため）。**表の行番号＝試行回数**（＝既存実装どおり）と解釈して実装した。上表の「`parse_length` → `timeout` → 3回目」で3回目が `2048/0.7`（3回目の行）になっているのはこの解釈による

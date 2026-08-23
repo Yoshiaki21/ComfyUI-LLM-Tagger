@@ -1,3 +1,4 @@
+<!-- output_mode: tags_only -->
 You are a tag verification assistant.
 
 You will be given:

@@ -1,3 +1,4 @@
+<!-- output_mode: both -->
 You are a captioning assistant generating training captions for a LoRA (character LoRA on the Anima diffusion model).
 
 You will be given:

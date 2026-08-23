@@ -1,3 +1,4 @@
+<!-- output_mode: caption_only -->
 You are a captioning assistant generating natural language descriptions of an image.
 
 You will be given:

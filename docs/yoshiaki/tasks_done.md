@@ -516,3 +516,49 @@
   - もし「2回目の行（`4096/0.5`）」が正しい場合は、`shrink_retry_params()` の索引の取り方を1行変えるだけで切り替え可能
 
 ---
+
+## タスク15: 指示書4.1「output_mode の自動判定（メタデータ行方式）」実装
+
+- **完了日**: 2026-08-23
+- **動作確認**: ✅済み（メタデータ判定の単体テスト7ケース＋実機で3モード＋異常系＋13.6リトライの回帰確認）
+- **新規ファイル**: なし
+- **修正ファイル**:
+  - `llm_caption_node.py` : `output_mode` ウィジェット廃止、メタデータ行の解析と異常系処理を追加
+  - `system_prompts/caption_training_both.txt` : 1行目に `<!-- output_mode: both -->` を追加
+  - `system_prompts/caption_tags_only.txt` : 1行目に `<!-- output_mode: tags_only -->` を追加
+  - `system_prompts/caption_text_only.txt` : 1行目に `<!-- output_mode: caption_only -->` を追加
+  - `LLM_Caption_Node_指示書.md` : 4.1.1「実装結果」を新設
+- **変更内容**:
+  - `INPUT_TYPES` から `output_mode` コンボボックスを削除。指示書8.1の規約どおり `IS_CHANGED` と `generate()` の引数も同時に削除して3箇所を揃えた（現在15項目）
+  - `parse_system_prompt_file(filename)` を追加。戻り値は `(output_mode, system_message)` で、**メタデータ行を取り除いた本文だけ**を返す（除去後に先頭へ残る空行も落とす）
+  - 判定は `OUTPUT_MODE_HEADER_PATTERN = ^\s*<!--\s*output_mode\s*:\s*([A-Za-z_]+)\s*-->\s*$` を**1行目のみ**に適用。空白の揺れは許容するが2行目以降は認識しない
+  - `VALID_OUTPUT_MODES = ("tags_only", "caption_only", "both")` 以外の値は不正扱い
+  - `generate()` 内で判定結果を内部変数 `output_mode` として保持し、`parse_response()` / サマリ行 / `SUCCESS` ログの参照先を差し替えた
+- **異常系の実装方針（指示書4.1の選択肢②を採用）**:
+  - コンボボックスからの除外（①）ではなく、**選択して実行した時点で失敗させる**方式にした。除外方式だとファイルが一覧から黙って消え、ユーザーが原因を特定できなくなるため
+  - `output_mode` が `None`（メタデータ行なし／値が3種類以外／ファイルが読めない）の場合、`INVALID_PROMPT_FILE: <filename> reason=missing_or_invalid_output_mode_header` を `log.log` と `error.log` に記録し、**その実行の全画像を LLM 呼び出し前にスキップ**する（7.2の `empty_tags` と同じ扱い）
+  - 各画像には `SKIPPED: <label> reason=invalid_prompt_file` を記録し、`caption_text` には空文字を入れて枚数・順序を維持（9章）
+  - ファイル読み込み時の `OSError` も握りつぶして `None` を返すため **ComfyUI 自体は止まらない**
+  - サマリ行では不正時に `mode=INVALID` と表示する
+- **検証結果**:
+  | 入力 | 判定 |
+  |---|---|
+  | 同梱3ファイル | `both` / `tags_only` / `caption_only`。本文に `output_mode` 行が残っていないことを確認 |
+  | メタデータ行なし | `None`（失敗扱い） |
+  | `<!-- output_mode: whatever -->` | `None`（失敗扱い） |
+  | 空ファイル | `None`（失敗扱い） |
+  | 2行目にメタデータ行 | `None`（1行目のみ判定） |
+  | `   <!--   output_mode :  both   -->   ` | `both`（空白の揺れを許容） |
+  | 存在しないファイル | `None`（例外を出さず失敗扱い） |
+  - **実機で3モードすべて実行**し、`mode=both` / `mode=tags_only` / `mode=caption_only` が自動判定されて各形式の文字列が出力されることを確認
+  - **`prompt.log` に `output_mode` の文字列が0件**（メタデータ行がLLMに送られていない）ことを確認
+  - メタデータ行なしのファイルを2枚バッチで選択 → `INVALID_PROMPT_FILE` を記録して2枚ともスキップ、出力は空文字2件で枚数維持
+  - `INPUT_TYPES` / `IS_CHANGED` / `generate()` の引数一致を `inspect` で再検証
+- **回帰確認**:
+  - 13.6のリトライ分岐（`parse_length` 倍増→クランプ、`timeout` への切替、`connection` 据え置き）が従来どおり動作することを再テストで確認
+  - 6章の `---` 区切りパース処理には手を入れていない（`parse_response()` の引数の渡し元が変わっただけ）
+- **備考**:
+  - 既存のワークフローには `output_mode` ウィジェットが残っているため、**ノードを配置し直すか、ワークフローを開き直して不要になったウィジェットを取り除く必要**がある可能性がある
+  - ユーザーが独自に追加した `.txt` がある場合、1行目にメタデータ行を追加しないと `INVALID_PROMPT_FILE` として失敗する
+
+---
