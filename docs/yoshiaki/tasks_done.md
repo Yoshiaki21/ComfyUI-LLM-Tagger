@@ -661,3 +661,48 @@
 - 指示書10章のサンプル全文は**旧文面のままだったため、実ファイルに合わせて更新した**（「更新済み」とのご指示だったが差分が入っていなかった）
 
 ---
+
+## タスク18: parse_format 失敗時の訂正指示（corrective instruction）の追加
+
+- **完了日**: 2026-08-23
+- **動作確認**: ✅済み（分岐5シナリオ＋caption_only の parse_format ケース＋ログ確認＋実機で全モード回帰）
+- **新規ファイル**: なし
+- **修正ファイル**:
+  - `llm_caption_node.py` : 訂正指示の追記、試行ごとの `PROMPT user` 記録、`RETRY` 行の note 複数対応
+  - `LLM_Caption_Node_指示書.md` : 5.2.1新設、13.3に note を追記、12章に2項目追加
+- **背景**:
+  - `---`区切りが無いフォーマット崩れ（`parse_format`）で、13.2の temperature 上昇・`max_tokens` 縮小だけでは同じ失敗が3回とも再現し、リトライが実質機能しない事例が実運用ログで確認された
+  - temperature の調整はランダムな揺さぶりに過ぎず、モデルに具体的な訂正内容を伝えていなかった
+- **変更内容**:
+  - 定数 `FORMAT_CORRECTION_NOTE` を追加（指定の英文をそのまま使用）
+  - `build_user_text(tags, trigger_word, format_correction=False)` / `build_messages(..., format_correction=False)` に引数を追加。**訂正指示は末尾に改行して追記するのみ**で、トリガーワード行・タグ行・画像パートの構成順序は変更していない
+  - `generate()` のリトライループ内で `format_correction = (previous_reason == REASON_PARSE_FORMAT)` を判定。`params_source` と同じく **`previous_reason` を上書きする前**に決める
+  - **`messages` の構築をループ前からループ内へ移動**（試行ごとに user message が変わるため）
+  - 2回連続で `parse_format` が続いた場合も毎回同じ固定文言を追記する
+  - 13.2 のパラメータ調整はそのまま維持して併用。13.6（`parse_length` の倍増）には影響なし
+- **ログ**:
+  - `RETRY` 行を複数 note に対応させ、訂正指示を追加した試行に `note=added_format_correction` を付記
+  - **`prompt.log` の `PROMPT user` を「画像ごと1回」から「試行ごと1回」に変更**（見出しに `attempt N/3` を追加）。従来のままでは訂正指示込みの user message が記録されず、指示の「その試行の user message 全文がそのまま記録されること」を満たせないため
+- **実装時の判断（指示からの逸脱・要確認）**:
+  - **訂正文は `---` 区切りと PART1/PART2 についての内容なので、`output_mode == "both"` のときのみ追記する**ようにした
+  - `tags_only` / `caption_only` は `---` を要求しないパース経路であり（6章）、これらのモードで「`---` で区切れ」と指示すると、そのまま出力された `---` 入りの応答が検証されずにキャプションとして返ってしまうため
+  - `caption_only` でも `parse_format`（本文なし・応答が短すぎる）は発生しうるが、その場合も訂正指示は追加されないことを確認済み
+  - モード無条件で追記すべき場合は、`format_correction` の条件から `output_mode == "both"` を外すだけで切り替え可能
+- **検証結果**:
+  | シナリオ | 訂正指示の追加 |
+  |---|---|
+  | `parse_format` ×3 | 試行1なし → **試行2・3にあり** |
+  | `timeout` → `parse_format` → … | 試行1・2なし → **試行3にあり**（timeout の次には付かない） |
+  | `parse_length` ×3 | 3回とも追加なし |
+  | `connection` ×3 | 3回とも追加なし |
+  | `caption_only` で `parse_format` ×3 | 3回とも追加なし（上記の判断による） |
+  - `log.log` 実例:
+    ```
+    RETRY: suzune028.png attempt=2/3 max_tokens=4096 temperature=0.5 applied=13.2_shrink(prev=parse_format) reason=parse_format note=added_format_correction detail=...
+    ```
+  - `prompt.log` に試行ごとの `PROMPT user ... (attempt 2/3)` が記録され、末尾に訂正指示の全文が入っていることを確認
+  - 実機で3モード（`both` / `tags_only` / `caption_only`）と `INVALID_PROMPT_FILE` の異常系が従来どおり動作することを確認
+- **備考**:
+  - `prompt.log` はリトライ時に user message が試行回数分記録されるようになったため、リトライが多発するとログがやや増える（`log_prompt` は既定OFFのため通常運用への影響はなし）
+
+---

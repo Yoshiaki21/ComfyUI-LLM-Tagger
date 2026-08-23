@@ -97,6 +97,16 @@ LOG_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 LEMONADE_CANCEL_PATH = ""
 CANCEL_TIMEOUT_SEC = 5
 
+# 5.2 parse_format で失敗した直後のリトライにだけ user message 末尾へ追記する訂正指示。
+# temperature の上げ下げはランダムな揺さぶりでしかなく、同じ崩れ方が3回とも再現する事例が
+# 実運用ログで確認されたため、何が足りなかったかを具体的にモデルへ伝える。
+FORMAT_CORRECTION_NOTE = (
+    'Note: Your previous response did not include a line containing exactly "---" to separate '
+    'PART 1 and PART 2. This is required. Make sure to output PART 1, then a line with only '
+    '"---", then PART 2.'
+)
+FORMAT_CORRECTION_LOG_NOTE = "note=added_format_correction"
+
 # 7.1 / 6.3 リトライ対象の失敗分類
 REASON_CONNECTION = "connection"
 REASON_TIMEOUT = "timeout"
@@ -275,23 +285,29 @@ def encode_image_base64(pil_image):
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def build_user_text(tags, trigger_word):
-    # 5.2 トリガーワードの有無で2パターン
+def build_user_text(tags, trigger_word, format_correction=False):
+    # 5.2 トリガーワードの有無で2パターン。
+    # format_correction=True のときのみ、末尾に訂正指示を追記する（構成順序は変更しない）。
     tags_block = f"Candidate tags from WD14 (verify against the image, correct as needed):\n{tags}"
     trigger_word = (trigger_word or "").strip()
     if trigger_word:
-        return f"Trigger word: {trigger_word}\n{tags_block}"
-    return tags_block
+        user_text = f"Trigger word: {trigger_word}\n{tags_block}"
+    else:
+        user_text = tags_block
+
+    if format_correction:
+        user_text = f"{user_text}\n{FORMAT_CORRECTION_NOTE}"
+    return user_text
 
 
-def build_messages(system_prompt_text, tags, trigger_word, image_base64):
+def build_messages(system_prompt_text, tags, trigger_word, image_base64, format_correction=False):
     # 5.2 テキスト部と画像部は同一 user message 内のパートとして含める
     return [
         {"role": "system", "content": system_prompt_text},
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": build_user_text(tags, trigger_word)},
+                {"type": "text", "text": build_user_text(tags, trigger_word, format_correction)},
                 {
                     "type": "image_url",
                     "image_url": {"url": f"data:{IMAGE_MIME_TYPE};base64,{image_base64}"},
@@ -1001,18 +1017,8 @@ class LLMCaptionGenerator:
 
             pil_image = resize_if_needed(tensor_to_pil(image_tensor))
             image_base64 = encode_image_base64(pil_image)
-            messages = build_messages(system_prompt_text, image_tags, trigger_word, image_base64)
-
             print(f"[LLMCaptionGenerator] {index}/{len(images)} 送信中 "
                   f"(size={pil_image.size[0]}x{pil_image.size[1]})")
-
-            if log_prompt:
-                user_text = build_user_text(image_tags, trigger_word)
-                write_prompt_log(
-                    log_dir,
-                    f"PROMPT user {label} ({index}/{len(images)}):",
-                    f"{user_text}\n{describe_image_part(pil_image, image_base64)}",
-                )
 
             # 7.1 4分類（connection / timeout / parse_length / parse_format）を
             # 同一カウンタで最大 MAX_ATTEMPTS 回試行する
@@ -1025,14 +1031,31 @@ class LLMCaptionGenerator:
             # 7.1 直前の試行の失敗理由に応じて次の試行のパラメータを分岐させる
             previous_reason = None
             for attempt in range(1, MAX_ATTEMPTS + 1):
-                # params_source は previous_reason を上書きする前に決める
+                # params_source / format_correction は previous_reason を上書きする前に決める
                 params_source = describe_params_source(previous_reason, attempt)
+                # 5.2 直前が parse_format のときだけ訂正指示を追記する。
+                # 訂正文が "---" 区切り（PART1/PART2）についての内容なので both のみ対象とする。
+                # timeout / connection / parse_length はフォーマットの問題ではないため追記しない。
+                format_correction = (previous_reason == REASON_PARSE_FORMAT
+                                     and output_mode == "both")
                 attempt_max_tokens, attempt_temperature, attempt_clamped = next_attempt_params(
                     previous_reason, attempt, attempt_max_tokens, attempt_temperature,
                     max_tokens, temperature, max_context_window, prompt_tokens
                 )
+                messages = build_messages(system_prompt_text, image_tags, trigger_word,
+                                          image_base64, format_correction)
                 payload = build_chat_payload(model, messages, enable_thinking,
                                              attempt_temperature, attempt_max_tokens)
+
+                if log_prompt:
+                    # 7.3.1 その試行で実際に送った user message をそのまま記録する
+                    write_prompt_log(
+                        log_dir,
+                        f"PROMPT user {label} ({index}/{len(images)}, "
+                        f"attempt {attempt}/{MAX_ATTEMPTS}):",
+                        f"{build_user_text(image_tags, trigger_word, format_correction)}\n"
+                        f"{describe_image_part(pil_image, image_base64)}",
+                    )
                 # 13.1 リクエストごとに一意なIDを発行し、タイムアウト時のキャンセルに使う
                 request_id = str(uuid.uuid4())
                 try:
@@ -1081,12 +1104,17 @@ class LLMCaptionGenerator:
                         cancel_request(log_dir, lemonade_host, lemonade_port,
                                        lemonade_api_key, request_id)
                     # 13.3 / 13.6.2 各試行で実際に使用したパラメータと分類を記録する。
-                    # クランプが発生した試行には note= を付記する。
-                    clamp_note = f" {CLAMP_LOG_NOTE}" if attempt_clamped else ""
+                    # クランプ・訂正指示の追加が発生した試行には note= を付記する。
+                    notes = []
+                    if attempt_clamped:
+                        notes.append(CLAMP_LOG_NOTE)
+                    if format_correction:
+                        notes.append(FORMAT_CORRECTION_LOG_NOTE)
+                    note_text = ("".join(f" {note}" for note in notes))
                     write_log(log_dir,
                               f"RETRY: {label} attempt={attempt}/{MAX_ATTEMPTS} "
                               f"max_tokens={attempt_max_tokens} temperature={attempt_temperature} "
-                              f"applied={params_source} reason={reason}{clamp_note} detail={e}")
+                              f"applied={params_source} reason={reason}{note_text} detail={e}")
                     if attempt == MAX_ATTEMPTS:
                         # 7.4 コンソールはファイル名＋簡易理由のみ。詳細はログファイル参照
                         print(f"[LLMCaptionGenerator] SKIPPED: {label} ({reason})")

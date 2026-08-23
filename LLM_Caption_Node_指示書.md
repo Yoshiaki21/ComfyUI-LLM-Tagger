@@ -142,6 +142,25 @@ Candidate tags from WD14 (verify against the image, correct as needed):
 
 **user message（画像部）**：base64エンコード済み画像（上記テキストと同一 user message 内に画像パートとして含める）
 
+#### 5.2.1 `parse_format` 失敗時の訂正指示【2026-08-23 追加・実装済み】
+
+**背景**：`---`区切りが無いフォーマット崩れ（`parse_format`）が起きた際、13.2 の temperature 上昇・`max_tokens` 縮小だけでは同じ失敗パターンが3回とも再現し、リトライが実質的に機能しない事例を実運用ログで確認した。temperature の調整はランダムな揺さぶりに過ぎず、モデルに具体的な訂正内容を伝えていないため。
+
+**仕様**：直前の試行の失敗理由が `parse_format` だった場合のみ、リトライ時の user message（テキスト部）の**末尾に改行して**以下を追記する。
+
+```
+Note: Your previous response did not include a line containing exactly "---" to separate PART 1 and PART 2. This is required. Make sure to output PART 1, then a line with only "---", then PART 2.
+```
+
+- **追記するのは直前が `parse_format` の場合のみ**。`timeout` / `connection` / `parse_length` はフォーマットの問題ではないため追記しない
+- 2回連続で `parse_format` が続いた場合も**毎回この固定文言を追記する**（前回効かなかったことへの言及は不要）
+- 画像パート・トリガーワード行・タグ行の**構成順序は変更しない**。訂正指示は末尾に追記するのみ
+- 13.2 のパラメータ調整（temperature 上昇・`max_tokens` 縮小）は**そのまま維持して併用**する。訂正指示は user message への追加であり、パラメータ調整とは独立した対処
+- 13.6（`parse_length` 時の `max_tokens` 倍増）には影響しない
+- **【実装時の判断】訂正文は `---` 区切りと PART1/PART2 についての内容なので、`output_mode == "both"` のときのみ追記する。** `tags_only` / `caption_only` は `---` を要求しないパース経路であり（6章）、これらのモードで「`---` で区切れ」と指示すると、そのまま出力された `---` 入りの応答が検証されずにキャプションとして返ってしまうため
+- 訂正指示を追加した試行では `log.log` の `RETRY` 行に `note=added_format_correction` を付記する（13.3）
+- `prompt.log`（7.3.1、`log_prompt` ON時）には**試行ごとに `PROMPT user` を記録**し、その試行で実際に送った user message（訂正指示込み）がそのまま残るようにする
+
 ### 5.3 パラメータ
 - `enable_thinking` を Lemonade Server のAPIパラメータ（またはプロンプト内指示、実装可能な方式に準拠）に反映
 - `temperature`, `max_tokens`, `top_p`（内部固定値 `1.0`）をリクエストに含める
@@ -456,6 +475,8 @@ Output ONLY the natural language description. No explanation, no extra text, no 
 - [ ] メタデータ行が無い／不正な値のファイルを選択した場合に、ComfyUI自体は止まらず適切に失敗扱い・ログ記録される（4.1）
 - [ ] トリガーワード空欄時にメッセージからトリガーワード行が省略される
 - [ ] 自然文パートに literal な `@` + trigger_word が残らないこと（6.1.1。trigger_word が代名詞のケース、temperature 0.3/0.5/0.7 のリトライパスを含めて確認）
+- [ ] 直前が `parse_format` のときだけ user message 末尾に訂正指示が追記され、`timeout` / `connection` / `parse_length` では追記されないこと（5.2.1、`prompt.log` で確認）
+- [ ] 訂正指示を追加した試行の `RETRY` 行に `note=added_format_correction` が記録されること（5.2.1・13.3）
 - [ ] タグ空文字入力時に即スキップ・ログ記録される
 - [ ] タイムアウト／接続失敗／パース失敗がそれぞれ3回リトライ後にスキップされる
 - [ ] `error.log` と `log.log` がノードディレクトリ直下の `logs/` に正しく追記される（7.3）
@@ -532,6 +553,10 @@ Lemonade Server は Router からバックエンド（llama.cpp 等）への内�
     ```
     RETRY: suzune_001.png attempt=2/3 max_tokens=4098 temperature=0.5 applied=13.2_shrink(prev=timeout) reason=parse_length detail=...
     ```
+- 5.2.1 の訂正指示を追加した試行には `note=added_format_correction` を付記する
+  ```
+  RETRY: suzune028.png attempt=2/3 max_tokens=4098 temperature=0.5 applied=13.2_shrink(prev=parse_format) reason=parse_format note=added_format_correction detail=...
+  ```
 - キャンセルAPIを呼び出した場合、その成否を記録する（例：`CANCEL_REQUEST_SENT request_id=xxxx` / `CANCEL_FAILED request_id=xxxx reason=...`）
 - `prompt.log`（7.3.1、`log_prompt` ON時）にも、リトライごとの `RESPONSE` 見出しに使用パラメータを付記する
 
