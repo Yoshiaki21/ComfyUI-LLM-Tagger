@@ -68,10 +68,28 @@ TAGS_CAPTION_DELIMITER = ". "
 # 大文字小文字は無視し、置換時はモデルが出した表記（文頭の大文字など）を保つ。
 LITERAL_AT_TRIGGER_NOTE = "stripped_literal_at_trigger_word"
 
+# 6.1.2 応答に混入するシステムプロンプトの節見出しの除去。
+# both モードのプロンプトが節見出しに使っている
+# "PART 1 — CORRECTED TAGS (Danbooru-style):" / "PART 2 — NATURAL LANGUAGE:" を
+# モデルがそのまま複写して出力する事例が実運用ログで確認された（237応答中46件＝約19%）。
+# 見出し行はタグ列の先頭・自然文の先頭に紛れ込み、学習用キャプションを直接壊す。
+# プロンプト側でも「見出しは出力しない」と明示したが、再発しうるためノード側でも後処理する
+# （6.1.1 の "@" + trigger_word 除去と同じ方針）。
+# 誤爆防止のため「行頭が PART + 1桁 で始まり、その行が ":" で終わる」行だけを見出しとみなす
+# （markdown の "**" / "#" 装飾は許容する）。自然文の途中に出る "part 1" は対象外。
+PART_HEADER_PATTERN = re.compile(
+    r"^[ \t]*[#*]{0,4}[ \t]*PART[ \t]*([12])\b[^\n]*:[ \t]*[*]{0,2}[ \t]*$",
+    re.MULTILINE | re.IGNORECASE)
+PART_HEADER_NOTE = "stripped_part_header"
+
 
 # 7章 エラーハンドリング・リトライ・ログ
-# 7.1 接続失敗／タイムアウト／パース失敗を同一カウンタで最大3回試行する
-MAX_ATTEMPTS = 3
+# 7.1 接続失敗／タイムアウト／パース失敗を同一カウンタで最大 max_retries 回試行する。
+# 回数は 2.1 の max_retries ウィジェットで指定する（初回送信を含む総試行回数）。
+# 下限1はリトライなし（初回失敗で即スキップ）、上限は暴走時の待ち時間が膨らむのを防ぐため10。
+DEFAULT_MAX_RETRIES = 3
+MIN_MAX_RETRIES = 1
+MAX_MAX_RETRIES = 10
 ERROR_LOG_FILENAME = "error.log"
 FULL_LOG_FILENAME = "log.log"
 # log_prompt が ON のときだけ書き出す、LLMへの送信内容と生応答の記録
@@ -101,9 +119,11 @@ CANCEL_TIMEOUT_SEC = 5
 # temperature の上げ下げはランダムな揺さぶりでしかなく、同じ崩れ方が3回とも再現する事例が
 # 実運用ログで確認されたため、何が足りなかったかを具体的にモデルへ伝える。
 FORMAT_CORRECTION_NOTE = (
-    'Note: Your previous response did not include a line containing exactly "---" to separate '
-    'PART 1 and PART 2. This is required. Make sure to output PART 1, then a line with only '
-    '"---", then PART 2.'
+    'Note: Your previous response did not follow the required output format. Output PART 1 '
+    '(the corrected tag list) first, then a line containing only "---", then PART 2 (the natural '
+    'language sentences). Do not swap the order of the two parts, and do not output the section '
+    'headings themselves (no "PART 1 ...:" or "PART 2 ...:" line) — output only the tags, the '
+    '"---" line, and the sentences.'
 )
 FORMAT_CORRECTION_LOG_NOTE = "note=added_format_correction"
 
@@ -115,11 +135,22 @@ REASON_PARSE_FORMAT = "parse_format"
 # 13.2 の縮小方向の調整を適用する分類（それ以外はパラメータを据え置く）
 SHRINK_REASONS = (REASON_TIMEOUT, REASON_PARSE_FORMAT)
 
-# 13.2 リトライ時のパラメータ調整（インデックスは 試行回数-1）。ウィジェットには公開しない。
+# 13.2 リトライ時のパラメータ調整。ウィジェットには公開しない。
 # 2回目は max_tokens 半分・temperature +0.2、3回目は 1/4・+0.4。下限/上限でクリップする。
-RETRY_MAX_TOKENS_SCALE = (1.0, 0.5, 0.25)
+#
+# 【max_retries 対応：案B（計算式への一般化）を採用】
+# 旧実装は3行固定のテーブル（scale 1.0/0.5/0.25、delta 0.0/0.2/0.4）だったが、
+# max_retries が3を超えると4回目以降の行が無い。案A（3回目の調整幅を据え置いて繰り返す）
+# ではなく案B（計算式）を採用した。理由は、テーブルの値がもともと「半分ずつ縮小・+0.2ずつ上昇」
+# という規則そのものであり、式にすれば試行回数が何回になっても同じ規則で延長できるため。
+#   max_tokens  = ウィジェット設定値 * RETRY_MAX_TOKENS_SHRINK_RATIO ** (試行回数-1)
+#   temperature = min(上限, ウィジェット設定値 + RETRY_TEMPERATURE_STEP * (試行回数-1))
+# 試行1〜3の結果は旧テーブルと完全に一致する（1.0 / 0.5 / 0.25、+0.0 / +0.2 / +0.4）。
+# 下限（RETRY_MAX_TOKENS_FLOOR）と上限（RETRY_TEMPERATURE_CEILING）は既存の定数のまま据え置き、
+# 4回目以降は下限テーブル末尾の値（256）と temperature 上限（1.0）でクリップされ続ける。
+RETRY_MAX_TOKENS_SHRINK_RATIO = 0.5
 RETRY_MAX_TOKENS_FLOOR = (0, 512, 256)
-RETRY_TEMPERATURE_DELTA = (0.0, 0.2, 0.4)
+RETRY_TEMPERATURE_STEP = 0.2
 RETRY_TEMPERATURE_CEILING = 1.0
 
 # 13.6 parse_length（finish_reason=="length"）時は max_tokens を直前の2倍にして再試行する
@@ -472,16 +503,31 @@ def strip_thinking(text):
 
 def split_both_parts(text):
     # 6章 both モード：最初の "---" 行で PART1（タグ）/ PART2（自然文）に分割
+    # 戻り値は (tags_part, caption_part, 見出しを除去したか)
     parts = PART_SEPARATOR_PATTERN.split(text, maxsplit=1)
     if len(parts) < 2:
         raise CaptionParseError("'---' 区切りが見つかりません")
 
     tags_part, caption_part = parts[0].strip(), parts[1].strip()
+
+    # 6.1.2 見出しが複写されている場合、その「位置」から PART1/PART2 の順序崩れを検出できる。
+    # 正しい順序なら PART 1 の見出しは区切りより前、PART 2 の見出しは区切りより後にしか出ない。
+    # 順序が入れ替わった応答（自然文→区切り→タグ、実運用ログで1件確認）は見出しを落としても
+    # 中身が入れ替わったままなので、除去せず parse_format として 7.1 のリトライに回す。
+    if "1" in find_part_header_numbers(caption_part):
+        raise CaptionParseError("'---' より後ろに PART 1 の見出しがあります（PART1/PART2の順序崩れ）")
+    if "2" in find_part_header_numbers(tags_part):
+        raise CaptionParseError("'---' より前に PART 2 の見出しがあります（PART1/PART2の順序崩れ）")
+
+    # 順序が正しければ見出しだけを落として採用する（リトライを消費しない）
+    tags_part, tags_stripped = strip_part_headers(tags_part)
+    caption_part, caption_stripped = strip_part_headers(caption_part)
+
     if not tags_part:
         raise CaptionParseError("'---' より前（PART1: タグ）が空です")
     if not caption_part:
         raise CaptionParseError("'---' より後（PART2: 自然文）が空です")
-    return tags_part, caption_part
+    return tags_part, caption_part, tags_stripped or caption_stripped
 
 
 def normalize_tag_list(tags_part, trigger_word):
@@ -495,6 +541,25 @@ def normalize_tag_list(tags_part, trigger_word):
     if trigger_word:
         tags = [tag for tag in tags if tag.lower() != trigger_word.lower()]
     return tags
+
+
+def find_part_header_numbers(text):
+    # 6.1.2 テキスト中に現れた見出しの番号（"1" / "2"）の集合を返す。
+    # 見出しの「位置」は PART1/PART2 の順序崩れの検出にも使う（split_both_parts）。
+    return {match.group(1) for match in PART_HEADER_PATTERN.finditer(text or "")}
+
+
+def strip_part_headers(text):
+    """6.1.2 プロンプトの節見出し行（"PART 1 — ...:" / "PART 2 — ...:"）を落とす。
+
+    戻り値は (text, 除去したか)。
+    """
+    if not text:
+        return text, False
+    stripped, count = PART_HEADER_PATTERN.subn("", text)
+    if not count:
+        return text, False
+    return stripped.strip(), True
 
 
 def strip_literal_at_trigger_word(text, trigger_word):
@@ -549,7 +614,8 @@ def classify_parse_failure(response_payload, requested_max_tokens):
 def parse_response(raw_response, output_mode, trigger_word, failure_category=REASON_PARSE_FORMAT):
     # 6章 パース本体。失敗時は CaptionParseError を送出する（7.1 のリトライ対象）。
     # failure_category には 6.3 の分類を渡し、送出する例外に付与する。
-    # 戻り値は (caption_text, "@"付きtrigger_wordを除去したか)
+    # 戻り値は (caption_text, notes)。notes は log.log に NOTE 行として残す注記のリスト
+    # （6.1.1 の stripped_literal_at_trigger_word / 6.1.2 の stripped_part_header）。
     try:
         return _parse_response_body(raw_response, output_mode, trigger_word)
     except CaptionParseError as e:
@@ -562,17 +628,33 @@ def _parse_response_body(raw_response, output_mode, trigger_word):
     if len(body) < MIN_VALID_RESPONSE_CHARS:
         raise CaptionParseError(f"応答が短すぎます ({len(body)}文字): {body!r}")
 
+    notes = []
     if output_mode == "both":
-        tags_part, caption_part = split_both_parts(body)
-        return combine_both_output(tags_part, caption_part, trigger_word)
+        tags_part, caption_part, header_stripped = split_both_parts(body)
+        if header_stripped:
+            notes.append(PART_HEADER_NOTE)
+        caption, at_stripped = combine_both_output(tags_part, caption_part, trigger_word)
+        if at_stripped:
+            notes.append(LITERAL_AT_TRIGGER_NOTE)
+        return caption, notes
+
+    # 6.1.2 tags_only / caption_only のプロンプトは PART 見出しを使わないが、
+    # 見出しが混入したときにキャプションを壊すのは同じなので保険として同じ後処理を通す。
+    body, header_stripped = strip_part_headers(body)
+    if header_stripped:
+        notes.append(PART_HEADER_NOTE)
+        if len(body) < MIN_VALID_RESPONSE_CHARS:
+            raise CaptionParseError(f"見出し行を除いた応答が短すぎます ({len(body)}文字): {body!r}")
 
     if output_mode == "caption_only":
         # caption_only も自然文を返すため both と同じ後処理を行う
-        return strip_literal_at_trigger_word(body, trigger_word)
+        body, at_stripped = strip_literal_at_trigger_word(body, trigger_word)
+        if at_stripped:
+            notes.append(LITERAL_AT_TRIGGER_NOTE)
 
-    # tags_only は </think> 除去後の応答全体をそのまま使う
+    # tags_only は </think> と見出し行を除いた応答全体をそのまま使う
     # （プロンプト側で "---" 区切りなしの単純テキストを返すよう指示している）
-    return body, False
+    return body, notes
 
 
 def first_value(value, default=None):
@@ -581,6 +663,20 @@ def first_value(value, default=None):
     if isinstance(value, list):
         return value[0] if value else default
     return default if value is None else value
+
+
+def resolve_max_retries(value):
+    """2.1 / 7.1 max_retries ウィジェット値を安全な試行回数（整数）に丸める。
+
+    max_retries ウィジェットが存在しなかった頃のワークフローJSONを読み込むと、値が
+    届かない（None）／型が違うことがある。その場合でもエラーにせず既定の3回を使う。
+    範囲外の値は 1〜10 にクリップする（下限1＝リトライなし、上限は暴走防止）。
+    """
+    try:
+        retries = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_RETRIES
+    return max(MIN_MAX_RETRIES, min(MAX_MAX_RETRIES, retries))
 
 
 def resolve_tags_per_image(tags, count):
@@ -748,15 +844,18 @@ def clamp_max_tokens(desired_max_tokens, prompt_tokens, max_context_window):
 
 
 def shrink_retry_params(attempt, base_max_tokens, base_temperature):
-    # 13.2 暴走の再発防止。表は「試行回数」で索く（基準はウィジェット設定値）。
-    index = min(attempt - 1, len(RETRY_MAX_TOKENS_SCALE) - 1)
-    scaled = int(base_max_tokens * RETRY_MAX_TOKENS_SCALE[index])
+    # 13.2 暴走の再発防止。調整幅は「試行回数」から計算する（基準はウィジェット設定値）。
+    # 案Bを採用しているため max_retries が4以上でも同じ規則で縮小・上昇を続けられる。
+    steps = attempt - 1
+    scaled = int(base_max_tokens * (RETRY_MAX_TOKENS_SHRINK_RATIO ** steps))
+    # 下限は既存の定数のまま。テーブルを超える試行回数では末尾の値（256）を使い続ける。
+    floor = RETRY_MAX_TOKENS_FLOOR[min(steps, len(RETRY_MAX_TOKENS_FLOOR) - 1)]
     # 下限でクリップしたうえで、元の設定値を超えないようにする
     # （ユーザーが下限より小さい max_tokens を設定している場合に増えてしまうのを防ぐ）
-    max_tokens = min(base_max_tokens, max(RETRY_MAX_TOKENS_FLOOR[index], scaled))
+    max_tokens = min(base_max_tokens, max(floor, scaled))
     # 浮動小数の誤差がログに出ないよう丸める（0.3 + 0.4 = 0.7000000000000001 対策）
     temperature = round(min(RETRY_TEMPERATURE_CEILING,
-                            base_temperature + RETRY_TEMPERATURE_DELTA[index]), 2)
+                            base_temperature + RETRY_TEMPERATURE_STEP * steps), 2)
     return max_tokens, temperature
 
 
@@ -875,6 +974,19 @@ class LLMCaptionGenerator:
                 # ON にすると LLM への送信内容と生応答を prompt.log に記録する（既定OFF）。
                 # システムプロンプトの検証用。コンソールには出さない（7.4準拠）。
                 "log_prompt": ("BOOLEAN", {"default": False}),
+                # 7.1 1画像あたりの最大試行回数（初回送信を含む総回数）。
+                # 【追加位置について】ComfyUI は保存済みワークフローの widgets_values を
+                # ウィジェットの定義順で位置対応させるため、既存ウィジェットの間に挿入すると
+                # 古いワークフローの値がずれる。そのため required の末尾に追加している。
+                # 値が無い古いワークフローでは resolve_max_retries() が既定の3を使う。
+                "max_retries": ("INT", {
+                    "default": DEFAULT_MAX_RETRIES,
+                    "min": MIN_MAX_RETRIES, "max": MAX_MAX_RETRIES,
+                    "tooltip": "1画像あたりの最大試行回数（初回送信を含む）。"
+                               "1でリトライなし（初回失敗で即スキップ）。"
+                               "失敗分類（connection/timeout/parse_length/parse_format）は"
+                               "このカウンタを共有します。",
+                }),
             },
             # ログに出す画像のファイル名（任意）。ComfyUI の IMAGE 型にはパス情報が
             # 含まれないため、LoRA Caption Load の namelist 相当を別途受け取る。
@@ -910,7 +1022,8 @@ class LLMCaptionGenerator:
     @classmethod
     def IS_CHANGED(cls, image, tags, trigger_word, system_prompt_file, lemonade_host,
                    lemonade_port, lemonade_api_key, model, enable_thinking, temperature, max_tokens,
-                   timeout_sec, always_regenerate, log_prompt, image_names=""):
+                   timeout_sec, always_regenerate, log_prompt,
+                   max_retries=DEFAULT_MAX_RETRIES, image_names=""):
         if first_value(always_regenerate, False):
             # ON: NaN は自身との等値比較が成立しないため、ComfyUI は常に「変化あり」と判断する
             return float("nan")
@@ -921,7 +1034,8 @@ class LLMCaptionGenerator:
 
     def generate(self, image, tags, trigger_word, system_prompt_file, lemonade_host,
                  lemonade_port, lemonade_api_key, model, enable_thinking, temperature, max_tokens,
-                 timeout_sec, always_regenerate=False, log_prompt=False, image_names=""):
+                 timeout_sec, always_regenerate=False, log_prompt=False,
+                 max_retries=DEFAULT_MAX_RETRIES, image_names=""):
         # always_regenerate はキャッシュ制御（IS_CHANGED）専用のため、生成処理では使用しない
         run_started = time.monotonic()
         # INPUT_IS_LIST = True のため全入力がリストで届く。tags 以外は単一値として取り出す。
@@ -936,6 +1050,8 @@ class LLMCaptionGenerator:
         max_tokens = first_value(max_tokens)
         timeout_sec = first_value(timeout_sec)
         log_prompt = first_value(log_prompt, False)
+        # 7.1 max_retries が無い古いワークフローでも落とさず既定の3回にフォールバックする
+        max_retries = resolve_max_retries(first_value(max_retries, DEFAULT_MAX_RETRIES))
         image_names = first_value(image_names, "")
 
         # 4.1 メタデータ行から output_mode を判定し、その行を除いた本文を system message にする
@@ -956,7 +1072,8 @@ class LLMCaptionGenerator:
         # （7.4 のコンソール出力簡略化を行う際もこの行は残すこと）
         summary = (f"開始: {len(images)}枚, model={model}, mode={output_mode or 'INVALID'}, "
                    f"prompt={system_prompt_file}, thinking={enable_thinking}, temp={temperature}, "
-                   f"top_p={FIXED_TOP_P}, max_tokens={max_tokens}, timeout={timeout_sec}s")
+                   f"top_p={FIXED_TOP_P}, max_tokens={max_tokens}, timeout={timeout_sec}s, "
+                   f"max_retries={max_retries}")
         print(f"[LLMCaptionGenerator] {summary}")
         print(f"[LLMCaptionGenerator] ログ出力先: {log_dir}")
         write_log(log_dir, f"RUN {summary}")
@@ -1021,7 +1138,7 @@ class LLMCaptionGenerator:
                   f"(size={pil_image.size[0]}x{pil_image.size[1]})")
 
             # 7.1 4分類（connection / timeout / parse_length / parse_format）を
-            # 同一カウンタで最大 MAX_ATTEMPTS 回試行する
+            # 同一カウンタで最大 max_retries 回試行する（初回送信を含む総試行回数）
             caption = ""
             # 13.6.1 クランプに使うプロンプト側トークン数。応答の usage が取れたら実測値へ差し替える
             prompt_tokens = estimate_prompt_tokens(
@@ -1030,7 +1147,7 @@ class LLMCaptionGenerator:
             attempt_max_tokens, attempt_temperature, attempt_clamped = max_tokens, temperature, False
             # 7.1 直前の試行の失敗理由に応じて次の試行のパラメータを分岐させる
             previous_reason = None
-            for attempt in range(1, MAX_ATTEMPTS + 1):
+            for attempt in range(1, max_retries + 1):
                 # params_source / format_correction は previous_reason を上書きする前に決める
                 params_source = describe_params_source(previous_reason, attempt)
                 # 5.2 直前が parse_format のときだけ訂正指示を追記する。
@@ -1052,7 +1169,7 @@ class LLMCaptionGenerator:
                     write_prompt_log(
                         log_dir,
                         f"PROMPT user {label} ({index}/{len(images)}, "
-                        f"attempt {attempt}/{MAX_ATTEMPTS}):",
+                        f"attempt {attempt}/{max_retries}):",
                         f"{build_user_text(image_tags, trigger_word, format_correction)}\n"
                         f"{describe_image_part(pil_image, image_base64)}",
                     )
@@ -1073,19 +1190,19 @@ class LLMCaptionGenerator:
                         timing = format_response_timing(elapsed, response_payload)
                         write_prompt_log(
                             log_dir,
-                            f"RESPONSE {label} (attempt {attempt}/{MAX_ATTEMPTS}, {timing}, "
+                            f"RESPONSE {label} (attempt {attempt}/{max_retries}, {timing}, "
                             f"max_tokens={attempt_max_tokens}, temp={attempt_temperature}):",
                             format_response_for_log(response_payload),
                         )
                     raw_response = extract_response_text(response_payload)
                     # 6.3 パース失敗時にどちらの分類として扱うかを finish_reason から決めておく
                     failure_category = classify_parse_failure(response_payload, attempt_max_tokens)
-                    caption, stripped_at_trigger = parse_response(
+                    caption, parse_notes = parse_response(
                         raw_response, output_mode, trigger_word, failure_category
                     )
-                    if stripped_at_trigger:
-                        write_log(log_dir,
-                                  f"NOTE: {LITERAL_AT_TRIGGER_NOTE} image={label}")
+                    # 6.1.1 / 6.1.2 後処理で応答に手を入れた場合は内容を NOTE として残す
+                    for note in parse_notes:
+                        write_log(log_dir, f"NOTE: {note} image={label}")
                     write_log(log_dir, f"SUCCESS: {label} mode={output_mode} attempt={attempt}")
                     success_count += 1
                     break
@@ -1112,15 +1229,15 @@ class LLMCaptionGenerator:
                         notes.append(FORMAT_CORRECTION_LOG_NOTE)
                     note_text = ("".join(f" {note}" for note in notes))
                     write_log(log_dir,
-                              f"RETRY: {label} attempt={attempt}/{MAX_ATTEMPTS} "
+                              f"RETRY: {label} attempt={attempt}/{max_retries} "
                               f"max_tokens={attempt_max_tokens} temperature={attempt_temperature} "
                               f"applied={params_source} reason={reason}{note_text} detail={e}")
-                    if attempt == MAX_ATTEMPTS:
+                    if attempt == max_retries:
                         # 7.4 コンソールはファイル名＋簡易理由のみ。詳細はログファイル参照
                         print(f"[LLMCaptionGenerator] SKIPPED: {label} ({reason})")
                         write_log(log_dir,
                                   f"SKIPPED: {label} reason={reason} "
-                                  f"({MAX_ATTEMPTS} attempts exhausted)",
+                                  f"({max_retries} attempts exhausted)",
                                   is_error=True)
                         # 9章：失敗時も空文字で枚数を揃える
                         caption = ""

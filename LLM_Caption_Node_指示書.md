@@ -44,6 +44,7 @@ LoRA Caption Load ──┬── image list ───────────�
 | `temperature` | `FLOAT` | 必須 | デフォルト `0.3` 程度、範囲 0.0〜2.0 |
 | `max_tokens` | `INT` | 必須 | **初期値**。デフォルト `8192`。13.2/13.6の自動増量ロジックの起点として使用する（ウィジェット値そのものを固定上限として使うわけではない） |
 | `timeout_sec` | `INT` | 必須 | デフォルト `120` |
+| `max_retries` | `INT`（ウィジェット） | 必須 | デフォルト `3`。1画像あたりの最大試行回数（**初回送信を含む総試行回数**）。範囲 1〜10（下限1＝リトライなし、上限は暴走時の待ち時間が膨らむのを防ぐため10）。7.1の4分類はこのカウンタを共有する。**ノード上のウィジェット表示順は本表の位置ではなく `log_prompt` の次（`required` の末尾）**：ComfyUI は保存済みワークフローの `widgets_values` をウィジェット定義順で位置対応させるため、既存ウィジェットの間に挿入すると古いワークフローの値がずれるため【2026-08-23 追加】 |
 | `always_regenerate` | `BOOLEAN` | 必須 | ON時は `IS_CHANGED` で毎回キャッシュ無効化 |
 | `log_prompt` | `BOOLEAN` | 必須 | 既定 `False`。ON時のみ `logs/prompt.log` に送信内容と生応答を記録（7.3.1） |
 | `image_names` | `STRING`（複数行、`optional`） | 任意 | ログに記録する画像ファイル名（改行区切り）。`LoRA Caption Load` の `namelist` 相当。未接続時は `image_001` 形式の連番をラベルに使う（7.3） |
@@ -149,8 +150,10 @@ Candidate tags from WD14 (verify against the image, correct as needed):
 **仕様**：直前の試行の失敗理由が `parse_format` だった場合のみ、リトライ時の user message（テキスト部）の**末尾に改行して**以下を追記する。
 
 ```
-Note: Your previous response did not include a line containing exactly "---" to separate PART 1 and PART 2. This is required. Make sure to output PART 1, then a line with only "---", then PART 2.
+Note: Your previous response did not follow the required output format. Output PART 1 (the corrected tag list) first, then a line containing only "---", then PART 2 (the natural language sentences). Do not swap the order of the two parts, and do not output the section headings themselves (no "PART 1 ...:" or "PART 2 ...:" line) — output only the tags, the "---" line, and the sentences.
 ```
+
+> **【2026-08-23 更新】** 6.1.2 の順序崩れ（パターンB）も `parse_format` として本訂正指示の対象になるため、文言を「`---` が無い」ことに限定せず、**順序と見出し**もあわせて訂正する内容に変更した。
 
 - **追記するのは直前が `parse_format` の場合のみ**。`timeout` / `connection` / `parse_length` はフォーマットの問題ではないため追記しない
 - 2回連続で `parse_format` が続いた場合も**毎回この固定文言を追記する**（前回効かなかったことへの言及は不要）
@@ -210,6 +213,35 @@ LLM応答は以下のマーカー形式で返させることを前提にパー�
 
 **副作用（要注意）**：プロンプトを「そのまま使え」に変更した結果、**`trigger_word` に `@` を含めている場合（例 `@melte`）、モデルが自然文から `@` を落とすことがある**（実測6回中4回）。`both` モードはタグ列先頭にプログラムが `@melte` を挿入するため影響は小さいが、**`caption_only` モードでは自然文がキャプション全体になるため、トリガートークンが `melte` になってしまう**。`@` 付きトリガーを `caption_only` で使う場合は要注意。
 
+#### 6.1.2 応答に混入する `PART 1` / `PART 2` 見出しの除去【2026-08-23 追加・実装済み】
+
+**症状**：`caption_training_both.txt` が節見出しに使っている `PART 1 — CORRECTED TAGS (Danbooru-style):` / `PART 2 — NATURAL LANGUAGE:` を、モデルが**そのまま応答に複写して出力する**。実運用ログ（`prompt.log`）の応答237件中**46件（約19%）**で発生していた。見出し行はタグ列の先頭・自然文の先頭に紛れ込むため、学習用キャプションが次のように壊れる：
+
+```
+suzune, PART 1 — CORRECTED TAGS (Danbooru-style):
+1girl, 1boy, looking at viewer, ... . PART 2 — NATURAL LANGUAGE:
+Shioyama Suzune is lying on a bed ...
+```
+
+**混入は2パターンあり、扱いを分ける**（実運用ログ46件の内訳＝A:45件 / B:1件）：
+
+| パターン | 応答の形 | 扱い |
+|---|---|---|
+| **A：見出しだけ混入** | `PART 1`見出し → タグ → `---` → `PART 2`見出し → 自然文（**順序は正しい**） | **見出し行を後処理で除去して採用**。中身は正しいのでリトライは消費しない |
+| **B：順序崩れ** | 自然文 → `---` → `PART 1`見出し＋タグ → `PART 2`見出し＋自然文 | **`parse_format` として7.1のリトライに回す**。見出しを落としてもタグと自然文が入れ替わったままで、除去では救えない |
+
+**対処は6.1.1と同じ2点セット**：
+
+1. `caption_training_both.txt` に **`OUTPUT FORMAT (follow exactly):` ブロック**を追加し、「見出しは*あなた向けのラベル*であって出力するものではない」「タグ → `---` → 自然文 の順を絶対に入れ替えない」ことを明示し、**正しい応答の実例**を1つ載せる（10.1）
+2. プロンプト修正だけでは再発しうるため、**ノード側にも保険の後処理**を置く
+   - 見出しとみなすのは「**行頭が `PART` + 1桁で始まり、その行が `:` で終わる**」行のみ（markdown の `**` / `#` 装飾は許容）。自然文中の `part 1 of the book` のような表現を誤爆させないための条件
+   - パターンBの検出には**見出しの「位置」**を使う。正しい順序なら `PART 1` の見出しは `---` より前、`PART 2` の見出しは `---` より後にしか現れない。`---` より後ろに `PART 1` の見出しがある（または前に `PART 2` がある）場合は順序崩れとして `CaptionParseError`（分類は `parse_format`）を送出する
+   - 除去した場合は `log.log` に `NOTE: stripped_part_header image=<name>` を記録する
+   - `tags_only` / `caption_only` のプロンプトは `PART` 見出しを使わないが、混入時にキャプションを壊すのは同じなので**保険として同じ後処理を通す**
+   - 見出しを除去した結果が空・短すぎる場合は失敗扱いにする（空キャプションを出力しない）
+
+**実測（実運用ログ237件を新パーサに通した結果）**：見出し混入45件が除去のうえ成功、順序崩れ1件がリトライへ、残り191件は**旧実装と1文字も変わらない**。旧実装が「成功」として採用していた順序崩れ1件（自然文がタグ列として出力されていた）だけが挙動変更となる。
+
 ### 6.2 パース失敗時の扱い
 - `---` マーカーが見つからない、または期待される形式でない場合は**応答不正**とみなし、7章のリトライ処理に従う
 
@@ -231,7 +263,9 @@ LLM応答は以下のマーカー形式で返させることを前提にパー�
 
 ### 7.1 リトライ対象（すべて同一カウントで統一）
 
-リトライが必要な失敗は以下の4種類に分類する（6.3参照）。**カウントは4種類合わせて共有し、最大3回リトライ**。3回とも失敗した場合は該当画像を**スキップ**し、処理を継続する。
+リトライが必要な失敗は以下の4種類に分類する（6.3参照）。**カウントは4種類合わせて共有し、最大 `max_retries` 回試行する**（2.1のウィジェット。初回送信を含む総試行回数で、既定 `3`）。`max_retries` 回とも失敗した場合は該当画像を**スキップ**し、処理を継続する。
+
+> **【2026-08-23 変更】試行回数を `max_retries` ウィジェットで可変にした。** 従来はコード内に固定値3を持っていたが、実運用で3回では回収しきれず SKIPPED になるケースがあったため、ワークフロー側で調整できるようにした。`max_retries = 1` はリトライなし（初回失敗で即スキップ）、上限は10。値を持たない古いワークフローJSONを読み込んだ場合は既定の3にフォールバックする（エラーにしない）。
 
 | 分類 | 内容 | 13.6でのパラメータ調整方針 |
 |---|---|---|
@@ -241,6 +275,7 @@ LLM応答は以下のマーカー形式で返させることを前提にパー�
 | `parse_format` | 応答のパース失敗のうち形式崩れ（`finish_reason == "stop"` 等、6.3参照） | `max_tokens`を縮小、temperatureを上昇（暴走対策・13.2） |
 
 - どの分類も**直前の試行の結果に基づいて次の調整を決める**（固定の試行回数テーブルではなく、都度分岐）。例：1回目`parse_length`→2回目`max_tokens`倍増→その結果2回目が`timeout`になった場合、3回目は13.2の縮小方向に切り替える
+- ログの試行表記は `attempt=N/{max_retries}` とし、分母には実際に設定された `max_retries` を出す（13.3）
 - ログには分類名を`reason=`として記録する（13.3参照）
 
 ### 7.2 事前チェック（リトライ対象外・即スキップ）
@@ -256,15 +291,15 @@ LLM応答は以下のマーカー形式で返させることを前提にパー�
 > - 実行開始時に実際の出力先パスをコンソールに1行出力する（`[LLMCaptionGenerator] ログ出力先: ...`）
 > - Docker運用の場合はコンテナ内パスになるため、ホストから参照するにはこのフォルダがバインドマウントされている必要がある
 
-- `error.log`：失敗（スキップ）したファイルのみを記録。フォーマット例：
+- `error.log`：失敗（スキップ）したファイルのみを記録。括弧内の回数は `max_retries` の設定値を出す。フォーマット例（`max_retries=3` の場合）：
   ```
-  [2026-08-15 12:34:56] SKIPPED: suzune_001.png reason=timeout (3 retries exhausted)
+  [2026-08-15 12:34:56] SKIPPED: suzune_001.png reason=timeout (3 attempts exhausted)
   [2026-08-15 12:35:10] SKIPPED: suzune_002.png reason=empty_tags
   ```
 - `log.log`：成功・失敗を含む全処理ログ（error.log の内容も含む）。`RUN END` 行には**実行全体の所要時間**を `elapsed=3分42秒` の形で常時記録する（`log_prompt` の ON/OFF に関わらず出力する）
   ```
   [2026-08-15 12:34:01] START: suzune_001.png
-  [2026-08-15 12:34:56] SKIPPED: suzune_001.png reason=timeout (3 retries exhausted)
+  [2026-08-15 12:34:56] SKIPPED: suzune_001.png reason=timeout (3 attempts exhausted)
   [2026-08-15 12:35:05] SUCCESS: suzune_003.png mode=both
   ```
 
@@ -285,7 +320,7 @@ LLM応答は以下のマーカー形式で返させることを前提にパー�
 | `==== RUN ... ====` | 実行開始時に1回 | 7.4.1 の設定値サマリと同じ文字列。実行の区切り |
 | `PROMPT system` | 実行開始時に1回 | 選択中のプロンプトファイル名・文字数と全文（バッチ内で不変のため1回だけ） |
 | `PROMPT user` | 画像ごと | トリガーワード行＋タグ（5.2のテキスト部）と画像パートの要約 |
-| `RESPONSE` | 試行ごと | 見出しに**所要時間とトークン生成速度**（例：`attempt 1/3, 50.4秒, 23.5 tok/s`）、本文に `finish_reason` / `usage` / `reasoning_content` 全文 / `content` 全文 |
+| `RESPONSE` | 試行ごと | 見出しに**所要時間とトークン生成速度**（例：`attempt 1/3, 50.4秒, 23.5 tok/s`。分母は `max_retries`）、本文に `finish_reason` / `usage` / `reasoning_content` 全文 / `content` 全文 |
 
 - **画像パートの base64 は絶対に記録しないこと**。1024×768のPNGで約1MBに達し、100枚で100MB増える。`<image 1024x768 PNG 約765KB / base64は省略>` のような要約に置換する
 - **thinking（`reasoning_content`）は全文を記録する**。プロンプトのどの指示が実行され、どれが無視されたかを判断できる唯一の材料であり、`</think>` 以降の本文だけでは「結果」しか分からないため。サイズは1枚あたり約4KBで、除外する base64 と比べれば無視できる
@@ -300,8 +335,9 @@ LLM応答は以下のマーカー形式で返させることを前提にパー�
 
 #### 7.4.1 設定値サマリ行（デバッグ用・必須）
 - **実行開始時に1回だけ**、送信パラメータのサマリをコンソールに出力する
-  - 出力例：`[LLMCaptionGenerator] 開始: 12枚, model=gemma-4-26B-A4B-it-QAT-GGUF, thinking=True, temp=0.3, top_p=1.0, max_tokens=8192, timeout=120s`
-  - 出力項目：画像枚数 / `model` / `enable_thinking` / `temperature` / `top_p`（内部固定値のためUIから見えない） / `max_tokens` / `timeout_sec`
+  - 出力例：`[LLMCaptionGenerator] 開始: 12枚, model=gemma-4-26B-A4B-it-QAT-GGUF, thinking=True, temp=0.3, top_p=1.0, max_tokens=8192, timeout=120s, max_retries=3`
+  - 出力項目：画像枚数 / `model` / `enable_thinking` / `temperature` / `top_p`（内部固定値のためUIから見えない） / `max_tokens` / `timeout_sec` / `max_retries`
+  - 同じ文字列を `log.log` の `RUN 開始` 行にも記録する（`max_retries` を含む）
   - バッチ内でこれらの値は不変のため、画像ごとには出力しない（100枚処理で同じ設定が100回出るのを避ける）
 - 画像ごとの進捗行は簡易表示のみとする（例：`[LLMCaptionGenerator] 1/12 送信中 (size=1024x768)`）
 - **重要**：本項の設定値サマリ行は、7章のコンソール出力簡略化を実装する際も **削除・省略しないこと**。設定ミス（`max_tokens` 不足による本文未生成など）に起因する不具合の切り分けに必須であり、実測でこの切り分けが必要になった経緯がある
@@ -361,7 +397,7 @@ LLM応答は以下のマーカー形式で返させることを前提にパー�
 
 ### 10.1 `caption_training_both.txt`（学習用・タグ+自然文両方）
 
-以下の内容をそのまま使用する（検証済み）。1行目のメタデータ行（4.1参照）を含めること：
+以下の内容をそのまま使用する（検証済み）。1行目のメタデータ行（4.1参照）を含めること。末尾の `OUTPUT FORMAT` ブロックは 6.1.2（`PART` 見出しの混入対策）で追加したもの：
 
 ```
 <!-- output_mode: both -->
@@ -393,6 +429,17 @@ PART 2 — NATURAL LANGUAGE:
 - Do NOT mention hair color, hair style, or eye color.
 - Avoid subjective/evaluative words.
 - Do NOT carry over composition/framing/meta tags (e.g. "cowboy shot", "close-up", "from above") into PART 2's prose — these are shot-type classifications, not natural descriptive language. Omit them from the sentence entirely, or describe framing only if it reads naturally.
+
+OUTPUT FORMAT (follow exactly):
+- "PART 1 — CORRECTED TAGS (Danbooru-style):" and "PART 2 — NATURAL LANGUAGE:" above are labels for YOU. Do NOT write them, or any other heading or label, in your response.
+- Your entire response must be: the tag line, then a line containing only "---", then the sentences. Nothing else.
+- Never swap the order: tags always come before the "---" line, sentences always after it.
+- No markdown, no bullet points, no explanation, no preamble.
+
+Example of a valid response (structure only — describe the actual image):
+1girl, smile, school uniform, sitting, classroom
+---
+charactername sits in a classroom wearing a school uniform, smiling toward the viewer.
 
 Be conservative: when the candidate tags and the image seem to genuinely agree, don't rewrite things unnecessarily — only correct what's actually wrong.
 ```
@@ -475,13 +522,20 @@ Output ONLY the natural language description. No explanation, no extra text, no 
 - [ ] メタデータ行が無い／不正な値のファイルを選択した場合に、ComfyUI自体は止まらず適切に失敗扱い・ログ記録される（4.1）
 - [ ] トリガーワード空欄時にメッセージからトリガーワード行が省略される
 - [ ] 自然文パートに literal な `@` + trigger_word が残らないこと（6.1.1。trigger_word が代名詞のケース、temperature 0.3/0.5/0.7 のリトライパスを含めて確認）
+- [ ] `PART 1` / `PART 2` の見出しが混入した応答（順序は正しい）で、見出しだけが除去されリトライを消費せず成功すること。`log.log` に `NOTE: stripped_part_header` が記録されること（6.1.2）
+- [ ] 見出しの位置が入れ替わった応答（`---` より後ろに `PART 1`）が `parse_format` としてリトライされること（6.1.2）
+- [ ] 自然文中の `part 1 of the book` のような表現が誤って除去されないこと（6.1.2）
 - [ ] 直前が `parse_format` のときだけ user message 末尾に訂正指示が追記され、`timeout` / `connection` / `parse_length` では追記されないこと（5.2.1、`prompt.log` で確認）
 - [ ] 訂正指示を追加した試行の `RETRY` 行に `note=added_format_correction` が記録されること（5.2.1・13.3）
 - [ ] タグ空文字入力時に即スキップ・ログ記録される
-- [ ] タイムアウト／接続失敗／パース失敗がそれぞれ3回リトライ後にスキップされる
+- [ ] タイムアウト／接続失敗／パース失敗がそれぞれ `max_retries` 回の試行後にスキップされる
+- [ ] `max_retries=1` で初回失敗が即スキップになる（リトライが発生しない）
+- [ ] `max_retries=5` で5回目まで試行が継続し、13.2の縮小（下限クリップ）・13.6の増量（上限クランプ）が破綻しない
+- [ ] `max_retries` を持たない古いワークフローJSONを読み込んでもエラーにならず、既定の3が使われる
+- [ ] `log.log` の `RUN 開始` 行に `max_retries=N` が記録され、試行表記の分母が `attempt=N/{max_retries}` になっている
 - [ ] `error.log` と `log.log` がノードディレクトリ直下の `logs/` に正しく追記される（7.3）
 - [ ] コンソール出力が簡易表示のみになっている
-- [ ] 実行開始時に設定値サマリ行（枚数/model/thinking/temperature/top_p/max_tokens/timeout）が1回だけ出力される（7.4.1）
+- [ ] 実行開始時に設定値サマリ行（枚数/model/thinking/temperature/top_p/max_tokens/timeout/max_retries）が1回だけ出力される（7.4.1）
 - [ ] `always_regenerate` ONで毎回再生成、OFFでキャッシュが効く
 - [ ] `log_prompt` ONで `prompt.log` にプロンプトと生応答が記録され、OFFでは作成されない（7.3.1）
 - [ ] `prompt.log` に画像の base64 が含まれていない（7.3.1）
@@ -490,7 +544,7 @@ Output ONLY the natural language description. No explanation, no extra text, no 
 - [ ] i番目の画像にi番目のタグが対応していること（9.1）
 - [ ] 通常の `Load Image`（1枚）と `LoRA Caption Load`（N枚）の両構成で動作すること（9.1）
 - [ ] タイムアウト発生時に `X-Request-Id` ベースのキャンセルAPIが呼ばれ、`log.log` に成否が記録されること（13.1、`LEMONADE_CANCEL_PATH` 設定時のみ）
-- [ ] リトライ2回目・3回目で `max_tokens` が縮小、`temperature` が上昇していること（`log.log` の試行ごとの記録で確認）（13.2）
+- [ ] リトライ2回目以降で `max_tokens` が縮小、`temperature` が上昇していること（`log.log` の試行ごとの記録で確認）（13.2）
 - [ ] リトライ発生時、`log.log` に各試行で使用したパラメータ値が記録されていること（13.3）
 - [ ] タイムアウト時にHTTP接続が確実にクローズされ、`log.log` に `CONNECTION_ABORTED` が記録されること（13.5）
 - [ ] リクエストがストリーミング（`stream: true`）で送られ、生成フェーズでタイムアウトした直後の次リクエストが遅延しないこと（13.5.5）
@@ -539,6 +593,16 @@ Lemonade Server は Router からバックエンド（llama.cpp 等）への内�
 | 1回目 | ウィジェット設定値そのまま | ウィジェット設定値そのまま |
 | 2回目 | 1回目の半分程度（下限を設ける。例：512） | +0.2（上限1.0程度でクリップ） |
 | 3回目 | 2回目の半分程度（下限を設ける。例：256） | +0.4（同上、上限でクリップ） |
+| 4回目以降 | 同じ規則で半分ずつ縮小（下限256でクリップ） | +0.2ずつ上昇（上限1.0でクリップ） |
+
+> **【2026-08-23 `max_retries` 対応：案Bを採用】** `max_retries`（2.1）が3を超える場合に備え、上表の固定3行を**計算式に一般化**した。案A（3回目の調整幅を据え置いて繰り返す）ではなく案Bを採ったのは、上表の値がもともと「半分ずつ縮小・+0.2ずつ上昇」という規則そのものであり、式にすれば試行回数が何回でも同じ規則で延長できるため。
+>
+> ```
+> max_tokens  = ウィジェット設定値 * 0.5 ** (試行回数 - 1)   # 下限でクリップ、設定値は超えない
+> temperature = min(1.0, ウィジェット設定値 + 0.2 * (試行回数 - 1))
+> ```
+>
+> 試行1〜3回目の結果は従来の表と**完全に一致する**（1.0 / 0.5 / 0.25、+0.0 / +0.2 / +0.4）。下限（`RETRY_MAX_TOKENS_FLOOR`）と上限（`RETRY_TEMPERATURE_CEILING`）は既存の定数のまま据え置き、下限テーブルを超える試行回数では末尾の値（256）を使い続ける。実測例（`max_tokens=8192`, `temperature=0.3`）：8192/0.3 → 4096/0.5 → 2048/0.7 → 1024/0.9 → 512/1.0 → 256/1.0（以降は据え置き）。
 
 - 上表の「1回目/2回目/3回目」は**試行回数（何度目のLLM呼び出しか）を指し、失敗分類の連続を意味しない**。例えば1回目`parse_length`→2回目`timeout`となった場合、2回目のtimeout対応は本表の「2回目」の行（半減・+0.2）を適用する
 - 調整幅・下限/上限は**ウィジェットとして公開せず、コード内の定数として実装する**（設定項目の肥大化を避ける方針）。ただし将来調整しやすいよう、ファイル冒頭付近に定数としてまとめておくこと
@@ -547,6 +611,7 @@ Lemonade Server は Router からバックエンド（llama.cpp 等）への内�
 ### 13.3 ログへの反映
 
 - `log.log` に、各試行で実際に使用した `max_tokens` / `temperature` を記録する。`reason` には7.1の4分類（`connection` / `timeout` / `parse_length` / `parse_format`）のいずれかを記録する
+- `attempt=` の**分母は `max_retries` の設定値**（以下の例はいずれも `max_retries=3` の場合）
   - 例（timeoutで縮小）：`[2026-08-23 14:02:11] RETRY: suzune_005.png attempt=2/3 max_tokens=512 temperature=0.5 reason=timeout`
   - 例（parse_lengthで増量、13.6）：`[2026-08-23 14:05:30] RETRY: suzune_008.png attempt=2/3 max_tokens=16384 temperature=0.3 reason=parse_length`
   - **【2026-08-23 追加】`applied=` フィールドを併記する**。`reason=` は「その試行が**失敗した**理由」であって「そのパラメータを**選んだ**理由」ではないため、両者を取り違えた誤読が実運用で発生した。`applied=` にはパラメータを決めた分岐を出す（`initial` / `13.2_shrink(prev=timeout)` / `13.6_grow(prev=parse_length)` / `keep(prev=connection)`）
@@ -630,9 +695,10 @@ Lemonade Server は v11.5.0 → v11.7.0 で以下の関連修正が入った：
 - `max_tokens` ウィジェットの意味を「固定の生成上限」から**「初期値（自動増量の起点）」**に変更する。デフォルトは `8192`
 - 分類が `parse_length`（6.3）だった場合、次の試行では `max_tokens` を**直前に使用した値の2倍**にして再送する（13.2の縮小方向とは逆）
   - 例：1回目 8192（`parse_length`）→ 2回目 16384 → それでも`parse_length`なら 3回目 32768
+  - **この「直前の2倍・`max_context_window`でクランプ」のロジック自体は `max_retries` の値に依存しない**。試行回数が増えれば同じ増量が自然に繰り返され、クランプ値に達した後はその値で頭打ちになるだけで、ロジックの変更は不要（【2026-08-23 `max_retries` 対応で確認】）
 - **上限クランプが必須**：3章でモデル一覧取得時に得られる `max_context_window`（そのモデルが対応する最大コンテキスト長）を用い、`max_tokens` が「プロンプト側の推定トークン数＋`max_tokens`」で `max_context_window` を超えないようクランプする。クランプが発生した場合、その試行の `max_tokens` はクランプ後の値を採用し、ログに `note=clamped_by_max_context_window` を付記する
 - プロンプト側の推定トークン数は厳密計算でなくてよい（文字数からの概算で可）。目的は「明らかに超過する組み合わせを避ける」ことであり、正確なトークナイザ一致は不要
-- リトライ予算は7.1の**合計3回を共有**する（`parse_length`専用の別枠は設けない）。増量後の試行が`timeout`や`parse_format`になった場合は、その時点で13.2の調整方針に切り替える（7.1参照）
+- リトライ予算は7.1の**合計 `max_retries` 回を共有**する（`parse_length`専用の別枠は設けない）。増量後の試行が`timeout`や`parse_format`になった場合は、その時点で13.2の調整方針に切り替える（7.1参照）
 
 ### 13.6.2 ログへの反映
 
@@ -649,6 +715,7 @@ Lemonade Server は v11.5.0 → v11.7.0 で以下の関連修正が入った：
 - [ ] `max_context_window`を超える増量が発生した場合にクランプされ、ログに`note=clamped_by_max_context_window`が記録されること
 - [ ] `parse_length`増量後の試行が`timeout`になった場合、その回のみ13.2の縮小方向の調整に切り替わること（固定表ではなく直前の失敗理由で分岐していること）
 - [ ] `max_tokens`ウィジェットを未接続時のデフォルト値`8192`から自動増量が開始されること
+- [ ] `max_retries`を4以上にした場合も増量が継続し、クランプ値に達した後はその値で頭打ちになること
 
 ### 13.5.5 ストリーミング必須の判明と対応【2026-08-23 追加・実装済み】
 

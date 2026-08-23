@@ -28,4 +28,15 @@ PART 2 — NATURAL LANGUAGE:
 - Avoid subjective/evaluative words.
 - Do NOT carry over composition/framing/meta tags (e.g. "cowboy shot", "close-up", "from above") into PART 2's prose — these are shot-type classifications, not natural descriptive language. Omit them from the sentence entirely, or describe framing only if it reads naturally.
 
+OUTPUT FORMAT (follow exactly):
+- "PART 1 — CORRECTED TAGS (Danbooru-style):" and "PART 2 — NATURAL LANGUAGE:" above are labels for YOU. Do NOT write them, or any other heading or label, in your response.
+- Your entire response must be: the tag line, then a line containing only "---", then the sentences. Nothing else.
+- Never swap the order: tags always come before the "---" line, sentences always after it.
+- No markdown, no bullet points, no explanation, no preamble.
+
+Example of a valid response (structure only — describe the actual image):
+1girl, smile, school uniform, sitting, classroom
+---
+charactername sits in a classroom wearing a school uniform, smiling toward the viewer.
+
 Be conservative: when the candidate tags and the image seem to genuinely agree, don't rewrite things unnecessarily — only correct what's actually wrong.
